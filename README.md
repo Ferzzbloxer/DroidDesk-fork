@@ -4,6 +4,10 @@ Run a full Linux desktop on any Android phone. Not a terminal. Not an emulator. 
 
 Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your entire setup comes with you.
 
+## Video
+
+[![Watch the video](https://img.youtube.com/vi/QCr4WWsfVv8/maxresdefault.jpg)](https://youtu.be/QCr4WWsfVv8)
+
 ## What This Actually Runs
 
 Everything below has been tested and confirmed working:
