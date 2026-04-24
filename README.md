@@ -34,7 +34,7 @@ The automatic menu sync scans what you install inside Proot and adds it directly
 
 - Any Android phone (ARM64)
 - [Termux](https://f-droid.org/en/packages/com.termux/) (install from F-Droid, not Play Store)
-- [Termux-X11](https://github.com/nickhz-termux/termux-x11/releases) (for on-phone display)
+- [Termux-X11](https://github.com/termux/termux-x11/releases/tag/nightly) (for on-phone display)
 
 ### For Monitor Output (Optional)
 
@@ -64,7 +64,7 @@ Do NOT use the Play Store version. It is outdated and will not work.
 ### Step 2: Install Termux-X11
 
 Download the latest APK from:
-https://github.com/nickhz-termux/termux-x11/releases
+https://github.com/termux/termux-x11/releases/tag/nightly
 
 Install it on your phone. This is the display server that renders the desktop.
 
