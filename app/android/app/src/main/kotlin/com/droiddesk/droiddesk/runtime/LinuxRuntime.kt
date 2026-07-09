@@ -29,6 +29,7 @@ class LinuxRuntime(private val context: Context) {
 
     private var prootProcess: Process? = null
     private var desktopProcess: Process? = null
+    @Volatile private var activeCommandProcess: Process? = null
 
     // ── Base directories (all inside app's private storage) ──
 
@@ -80,7 +81,7 @@ class LinuxRuntime(private val context: Context) {
     /**
      * Start a proot Linux session with the specified desktop environment.
      */
-    fun startSession(desktopEnv: String = "xfce4") {
+    fun startSession(desktopEnv: String = "xfce4", mode: String = "vnc") {
         if (isRunning()) {
             Log.w(TAG, "Session already running")
             return
@@ -94,6 +95,87 @@ class LinuxRuntime(private val context: Context) {
         val prootBin = File(context.applicationInfo.nativeLibraryDir, "libproot.so").absolutePath
         val rootfs = rootfsDir.absolutePath
 
+        val runScript = if (mode == "vnc") {
+            """
+            # ── Fix Locale ──
+            export LANG=C.UTF-8
+            export LC_ALL=C.UTF-8
+            export LANGUAGE=C.UTF-8
+
+            # ── Disable AT-SPI accessibility bus ──
+            export NO_AT_BRIDGE=1
+            export GTK_A11Y=none
+
+            export XDG_RUNTIME_DIR=/tmp/run/user/0
+            mkdir -p /tmp/run/user/0
+
+            echo "DIAG: Installing VNC Server..."
+            DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server x11-xserver-utils >/dev/null 2>&1 || true
+            
+            echo "DIAG: Configuring VNC Server..."
+            mkdir -p ~/.vnc
+            echo "password" | vncpasswd -f > ~/.vnc/passwd
+            chmod 600 ~/.vnc/passwd
+            
+            cat << 'EOF' > ~/.vnc/xstartup
+            #!/bin/sh
+            export DISPLAY=:0
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export GALLIUM_DRIVER=llvmpipe
+            export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+            xrdb ${'$'}HOME/.Xresources || true
+            exec startxfce4
+            EOF
+            chmod +x ~/.vnc/xstartup
+            
+            # Kill existing VNC if any
+            vncserver -kill :0 >/dev/null 2>&1 || true
+            rm -rf /tmp/.X11-unix/X0 /tmp/.X0-lock
+            
+            echo "DIAG: Launching VNC Server on :0 ..."
+            # Use VncAuth to ensure compatibility with flutter_rfb
+            vncserver :0 -localhost no -geometry 1080x2400 -depth 24 -SecurityTypes VncAuth
+            
+            echo "DIAG: VNC Server started. Tailing log..."
+            tail -f ~/.vnc/*:0.log
+            """.trimIndent()
+        } else {
+            """
+            # ── Fix Locale ──
+            export LANG=C.UTF-8
+            export LC_ALL=C.UTF-8
+            export LANGUAGE=C.UTF-8
+
+            # ── Disable AT-SPI accessibility bus ──
+            export NO_AT_BRIDGE=1
+            export GTK_A11Y=none
+
+            # ── Wait for X11 server ──
+            echo "DIAG: Waiting 3s for X server..."
+            sleep 3
+            
+            echo "DIAG: Checking /tmp/.X11-unix/"
+            ls -la /tmp/.X11-unix/ 2>&1
+
+            # ── Display & rendering ──
+            export DISPLAY=:0
+            export XDG_RUNTIME_DIR=/tmp/run/user/0
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export GALLIUM_DRIVER=llvmpipe
+            export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+            # Launch XFCE4 Session
+            echo "DIAG: Launching xfce4-session on DISPLAY=:0 ..."
+            
+            # Use software rendering for xfwm4 to prevent GL errors
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export GALLIUM_DRIVER=llvmpipe
+            
+            # Suppress dbus warnings by making sure we have a session bus
+            dbus-launch --exit-with-session xfce4-session
+            """.trimIndent()
+        }
+
         // Build proot command
         val command = mutableListOf(
             prootBin,
@@ -106,10 +188,10 @@ class LinuxRuntime(private val context: Context) {
             "--root-id",          // Fake root (uid 0)
             "--kill-on-exit",     // Clean up child processes
             "--link2symlink",     // Handle hardlink limitations
-            "/bin/bash", "--login"
+            "/bin/bash", "-c", runScript
         )
 
-        Log.i(TAG, "Starting proot session: ${command.joinToString(" ")}")
+        Log.i(TAG, "Starting proot session for $desktopEnv in mode $mode")
 
         val env = buildEnvironment(desktopEnv)
 
@@ -120,28 +202,22 @@ class LinuxRuntime(private val context: Context) {
                 pb.environment().putAll(env)
             }
             .start()
+        
+        // Log output in background thread for debugging
+        Thread {
+            val reader = java.io.InputStreamReader(prootProcess!!.inputStream)
+            val buffer = CharArray(1024)
+            var charsRead: Int
+            while (reader.read(buffer).also { charsRead = it } != -1) {
+                Log.d(TAG, "DESKTOP: " + String(buffer, 0, charsRead))
+            }
+        }.start()
 
         Log.i(TAG, "Proot session started")
     }
 
     /**
-     * Start the desktop environment inside the running proot session.
-     */
-    fun startDesktop(desktopEnv: String = "xfce4") {
-        val startCmd = when (desktopEnv) {
-            "xfce4" -> "startxfce4"
-            "lxqt" -> "startlxqt"
-            "mate" -> "mate-session"
-            "kde" -> "startplasma-x11"
-            else -> "startxfce4"
-        }
-
-        executeCommand("export DISPLAY=:0 && dbus-run-session $startCmd &")
-        Log.i(TAG, "Desktop environment started: $desktopEnv")
-    }
-
-    /**
-     * Stop all running sessions.
+     * Stop the running proot session.
      */
     fun stopSession() {
         Log.i(TAG, "Stopping Linux session...")
@@ -196,6 +272,8 @@ class LinuxRuntime(private val context: Context) {
                     pb.environment().putAll(buildEnvironment())
                 }
                 .start()
+                
+            activeCommandProcess = process
 
             val output = StringBuilder()
             val reader = java.io.InputStreamReader(process.inputStream)
@@ -208,13 +286,31 @@ class LinuxRuntime(private val context: Context) {
                 onOutput?.invoke(chunk)
             }
             process.waitFor()
+            activeCommandProcess = null
             Log.d(TAG, "Command finished with exit code: ${process.exitValue()}")
             Log.d(TAG, "Final output length: ${output.length}")
+            
+            if (process.exitValue() != 0) {
+                throw Exception("Command failed with exit code ${process.exitValue()}. Output: \n$output")
+            }
+            
             output.toString()
         } catch (e: Exception) {
+            activeCommandProcess = null
             Log.e(TAG, "Command execution failed: ${e.message}")
             "Error: ${e.message}"
         }
+    }
+
+    /**
+     * Interrupts the currently executing command.
+     */
+    fun interruptCommand() {
+        activeCommandProcess?.let {
+            Log.d(TAG, "Interrupting active command...")
+            it.destroy()
+        }
+        activeCommandProcess = null
     }
 
     // ── Environment ──
@@ -236,6 +332,7 @@ class LinuxRuntime(private val context: Context) {
             "LD_LIBRARY_PATH" to context.applicationInfo.nativeLibraryDir,
             "PROOT_LOADER" to File(context.applicationInfo.nativeLibraryDir, "libproot-loader.so").absolutePath,
             "PROOT_NO_SECCOMP" to "1",
+            "DISPLAY" to ":0",
 
             // GPU acceleration (Mesa/Turnip/Zink)
             "MESA_NO_ERROR" to "1",
@@ -249,11 +346,10 @@ class LinuxRuntime(private val context: Context) {
         )
 
         if (desktopEnv.isNotEmpty()) {
-            env["XDG_SESSION_TYPE"] to "x11"
-            env["XDG_RUNTIME_DIR"] to "/tmp/runtime-root"
-            env["XDG_DATA_DIRS"] to "/usr/share:/usr/local/share"
-            env["XDG_CONFIG_DIRS"] to "/etc/xdg"
-            env["DISPLAY"] to ":0"
+            env["XDG_SESSION_TYPE"] = "x11"
+            env["XDG_RUNTIME_DIR"] = "/tmp/runtime-root"
+            env["XDG_DATA_DIRS"] = "/usr/share:/usr/local/share"
+            env["XDG_CONFIG_DIRS"] = "/etc/xdg"
         }
 
         return env

@@ -38,12 +38,13 @@ android {
         }
     }
 
-    // Enable native (C/C++) build support for future wlroots integration
-    // externalNativeBuild {
-    //     cmake {
-    //         path = file("src/main/cpp/CMakeLists.txt")
-    //     }
-    // }
+    // Enable native (C/C++) build support for wlroots integration
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 }
 
 flutter {

@@ -48,6 +48,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Native Desktop Activity (Running in separate process to bypass Flutter's main thread) -->
+        <activity
+            android:name=".view.DesktopActivity"
+            android:process=":x11"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+
         <!-- Foreground Service: keeps proot + compositor alive -->
         <service
             android:name=".service.DroidDeskService"
@@ -58,6 +65,8 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+
     </application>
 
     <queries>

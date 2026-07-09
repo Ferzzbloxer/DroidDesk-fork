@@ -3,8 +3,10 @@ import 'package:provider/provider.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
 import 'package:droiddesk/state/app_state.dart';
+import 'package:droiddesk/screens/vnc_desktop_screen.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:flutter/services.dart';
+import 'package:droiddesk/screens/desktop_screen.dart';
 
 /// Home dashboard — shown after setup is complete.
 /// Central hub for launching the desktop, terminal, and managing the environment.
@@ -97,6 +99,37 @@ class HomeScreen extends StatelessWidget {
                   padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
                   child: Column(
                     children: [
+                      // ── Install Desktop ──
+                      _ActionCard(
+                        icon: Icons.download_rounded,
+                        title: 'Install ${state.selectedDE.toUpperCase()}',
+                        subtitle: state.isExtracting && state.statusMessage != null 
+                            ? state.statusMessage! 
+                            : 'Install desktop environment packages (one-time setup)',
+                        color: DroidTheme.secondary,
+                        onTap: () {
+                          if (!state.isExtracting) {
+                            state.installDesktopEnvironment();
+                          }
+                        },
+                      ),
+                      
+                      if (state.isExtracting && state.statusMessage != null && state.statusMessage!.contains("Installing"))
+                         Padding(
+                           padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 16),
+                           child: ClipRRect(
+                             borderRadius: BorderRadius.circular(4),
+                             child: LinearProgressIndicator(
+                               value: state.extractProgress > 0 ? state.extractProgress : null,
+                               backgroundColor: DroidTheme.surfaceBorder,
+                               color: DroidTheme.primary,
+                               minHeight: 4,
+                             ),
+                           ),
+                         ),
+
+                      const SizedBox(height: 10),
+
                       // ── Launch Desktop ──
                       _ActionCard(
                         icon: Icons.desktop_mac_rounded,
@@ -108,11 +141,15 @@ class HomeScreen extends StatelessWidget {
                         gradient: state.isRunning
                             ? null
                             : DroidTheme.primaryGradient,
-                        onTap: () {
-                          if (state.isRunning) {
-                            state.stopLinux();
-                          } else {
-                            state.startLinux();
+                        onTap: () async {
+                          if (!state.isRunning) {
+                            await state.startLinux(mode: 'vnc');
+                          }
+                          if (context.mounted) {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (_) => const VncDesktopScreen()),
+                            );
                           }
                         },
                       ),
@@ -461,44 +498,30 @@ class _TerminalSheet extends StatefulWidget {
 class _TerminalSheetState extends State<_TerminalSheet> {
   final _controller = TextEditingController();
   final _scrollController = ScrollController();
-  final List<String> _output = ['DroidDesk Linux Terminal\nType commands below.\n'];
 
   @override
   void initState() {
     super.initState();
-    const MethodChannel('com.droiddesk/core').setMethodCallHandler((call) async {
-      if (call.method == 'onTerminalOutput') {
-        final text = call.arguments['text'] as String;
-        debugPrint('TERMINAL STREAM: $text');
-        if (!mounted) return;
-        setState(() {
-          if (_output.isEmpty) _output.add('');
-          
-          // Basic carriage return handling to prevent messy progress bars
-          final cleanedText = text.replaceAll(RegExp(r'.*\r(?!\n)'), '');
-          final lines = cleanedText.split('\n');
-          
-          for (int i = 0; i < lines.length; i++) {
-            if (i == 0) {
-              _output[_output.length - 1] += lines[i];
-            } else {
-              _output.add(lines[i]);
-            }
-          }
-        });
-        
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scrollController.hasClients) {
-            _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-          }
-        });
+    // Auto-scroll when new output arrives via state listener
+    widget.state.addListener(_onStateChanged);
+  }
+  
+  void _onStateChanged() {
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 100),
+          curve: Curves.easeOut,
+        );
       }
     });
   }
 
   @override
   void dispose() {
-    const MethodChannel('com.droiddesk/core').setMethodCallHandler(null);
+    widget.state.removeListener(_onStateChanged);
     _controller.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -508,34 +531,10 @@ class _TerminalSheetState extends State<_TerminalSheet> {
     final cmd = _controller.text.trim();
     if (cmd.isEmpty) return;
 
-    setState(() {
-      _output.add('\$ $cmd');
-    });
     _controller.clear();
 
-    // Execute command and stream output
-    final result = await widget.state.executeCommand(cmd);
-    
-    // Fallback: If streaming didn't catch the output (e.g. if the MethodChannel disconnected), 
-    // we manually append the final result.
-    if (result.isNotEmpty && result.trim().isNotEmpty) {
-      setState(() {
-        if (_output.isEmpty || !_output.last.contains(result.trim().substring(0, 1))) {
-          _output.add(result);
-        }
-      });
-    }
-
-    // Scroll to bottom
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
-      }
-    });
+    // Execute command and stream output (handled globally by AppState)
+    await widget.state.executeCommand(cmd);
   }
 
   @override
@@ -568,6 +567,17 @@ class _TerminalSheetState extends State<_TerminalSheet> {
                   const SizedBox(width: 8),
                   Text('Terminal', style: DroidTheme.headingSm),
                   const Spacer(),
+                  // Stop Command Button
+                  IconButton(
+                    icon: const Icon(Icons.stop_circle_rounded, color: DroidTheme.error, size: 20),
+                    onPressed: () {
+                      widget.state.interruptCommand();
+                      widget.state.appendTerminalOutput('\n^C (Command interrupted)\n');
+                    },
+                    tooltip: 'Interrupt Command (Ctrl+C)',
+                    splashRadius: 20,
+                  ),
+                  const SizedBox(width: 8),
                   Text('proot · ${widget.state.installedDistro}', style: DroidTheme.monoSm),
                 ],
               ),
@@ -580,15 +590,14 @@ class _TerminalSheetState extends State<_TerminalSheet> {
               child: ListView.builder(
                 controller: _scrollController,
                 padding: const EdgeInsets.all(12),
-                itemCount: _output.length,
-                itemBuilder: (context, i) {
-                  return SelectableText(
-                    _output[i],
+                itemCount: widget.state.terminalOutput.length,
+                itemBuilder: (context, index) {
+                  return Text(
+                    widget.state.terminalOutput[index],
                     style: DroidTheme.mono.copyWith(
-                      color: _output[i].startsWith('\$')
-                          ? DroidTheme.secondary
+                      color: widget.state.terminalOutput[index].startsWith('\$')
+                          ? DroidTheme.accent
                           : DroidTheme.textSecondary,
-                      fontSize: 12,
                       height: 1.4,
                     ),
                   );

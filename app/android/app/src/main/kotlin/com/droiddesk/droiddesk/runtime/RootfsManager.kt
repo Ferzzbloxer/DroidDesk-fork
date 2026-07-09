@@ -366,12 +366,13 @@ class RootfsManager(private val context: Context) {
     fun installDesktopEnvironment(
         de: String,
         runtime: LinuxRuntime,
-        onProgress: (Double, String) -> Unit
+        onProgress: (Double, String) -> Unit,
+        onLog: (String) -> Unit
     ) {
         thread(name = "de-install") {
             try {
                 onProgress(0.0, "Updating package lists...")
-                runtime.executeCommand("apt-get update -y")
+                runtime.executeCommand("apt-get update -y", onLog)
 
                 val packages = when (de) {
                     "xfce4" -> "xfce4 xfce4-terminal xfce4-whiskermenu-plugin thunar mousepad dbus-x11"
@@ -381,16 +382,26 @@ class RootfsManager(private val context: Context) {
                     else -> "xfce4 xfce4-terminal dbus-x11"
                 }
 
+                // Fix interrupted dpkg if any
+                runtime.executeCommand("DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC dpkg --configure -a", onLog)
+                
+                // Fix broken dependencies from interrupted apt installs
+                runtime.executeCommand("DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -f -y", onLog)
+
                 onProgress(0.2, "Installing $de packages...")
                 runtime.executeCommand(
-                    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages"
+                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends $packages", onLog
                 )
 
                 onProgress(0.8, "Installing core utilities...")
-                runtime.executeCommand(
-                    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
-                    "firefox-esr git wget curl python3 python3-pip htop nano sudo"
+                val result = runtime.executeCommand(
+                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
+                    "git wget curl python3 python3-pip htop nano sudo libgl1", onLog
                 )
+                
+                if (result.contains("E: ")) {
+                    throw Exception("Apt-get failed: Check terminal output.")
+                }
 
                 onProgress(1.0, "$de installation complete!")
 

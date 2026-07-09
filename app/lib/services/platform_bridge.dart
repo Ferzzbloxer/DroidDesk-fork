@@ -10,6 +10,8 @@ class DroidDeskPlatform {
   // Callback handlers (set by the UI layer)
   static Function(double progress, String status)? onDownloadProgress;
   static Function(double progress, String status)? onExtractProgress;
+  static Function(double progress, String status)? onInstallProgress;
+  static Function(String text)? onTerminalOutput;
 
   /// Initialize platform channel listeners
   static void init() {
@@ -28,6 +30,17 @@ class DroidDeskPlatform {
             (args['progress'] as num).toDouble(),
             args['status'] as String,
           );
+          break;
+        case 'onInstallProgress':
+          final args = call.arguments as Map;
+          onInstallProgress?.call(
+            (args['progress'] as num).toDouble(),
+            args['status'] as String,
+          );
+          break;
+        case 'onTerminalOutput':
+          final args = call.arguments as Map;
+          onTerminalOutput?.call(args['text'] as String);
           break;
       }
     });
@@ -63,14 +76,22 @@ class DroidDeskPlatform {
     await _channel.invokeMethod('extractRootfs');
   }
 
+  static Future<void> installDesktopEnvironment(String distro) async {
+    await _channel.invokeMethod('installDesktopEnvironment', {'de': distro});
+  }
+
   // ── Linux Session ──
 
-  static Future<void> startLinux({String de = 'xfce4'}) async {
-    await _channel.invokeMethod('startLinux', {'de': de});
+  static Future<void> startLinux({String de = 'xfce4', String mode = 'vnc'}) async {
+    await _channel.invokeMethod('startLinux', {'de': de, 'mode': mode});
   }
 
   static Future<void> stopLinux() async {
     await _channel.invokeMethod('stopLinux');
+  }
+
+  static Future<void> launchDesktopActivity() async {
+    await _channel.invokeMethod('launchDesktopActivity');
   }
 
   static Future<String> executeCommand(String command) async {
@@ -78,6 +99,10 @@ class DroidDeskPlatform {
       'command': command,
     });
     return result as String? ?? '';
+  }
+
+  static Future<void> interruptCommand() async {
+    await _channel.invokeMethod('interruptCommand');
   }
 
   // ── Battery Optimization ──

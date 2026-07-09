@@ -13,7 +13,9 @@ import android.provider.Settings
 import com.droiddesk.droiddesk.service.DroidDeskService
 import com.droiddesk.droiddesk.runtime.LinuxRuntime
 import com.droiddesk.droiddesk.runtime.RootfsManager
+import com.droiddesk.droiddesk.view.AndroidSurfaceViewFactory
 import kotlin.concurrent.thread
+import android.os.Handler
 
 class MainActivity : FlutterActivity() {
 
@@ -32,6 +34,11 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        flutterEngine
+            .platformViewsController
+            .registry
+            .registerViewFactory("droiddesk-surface", AndroidSurfaceViewFactory())
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -90,12 +97,50 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(true)
                 }
+                
+                "installDesktopEnvironment" -> {
+                    val desktopEnv = call.argument<String>("de") ?: "xfce4"
+                    rootfsManager.installDesktopEnvironment(
+                        desktopEnv, 
+                        linuxRuntime, 
+                        { progress, status ->
+                            runOnUiThread {
+                                flutterEngine.dartExecutor.binaryMessenger.let { messenger ->
+                                    MethodChannel(messenger, CHANNEL).invokeMethod(
+                                        "onInstallProgress",
+                                        mapOf("progress" to progress, "status" to status)
+                                    )
+                                }
+                            }
+                        },
+                        { logChunk ->
+                            runOnUiThread {
+                                flutterEngine.dartExecutor.binaryMessenger.let { messenger ->
+                                    MethodChannel(messenger, CHANNEL).invokeMethod(
+                                        "onTerminalOutput", 
+                                        mapOf("text" to logChunk)
+                                    )
+                                }
+                            }
+                        }
+                    )
+                    result.success(true)
+                }
 
                 // ── Linux Session ──
                 "startLinux" -> {
                     val desktopEnv = call.argument<String>("de") ?: "xfce4"
+                    val mode = call.argument<String>("mode") ?: "vnc"
                     startForegroundService()
-                    linuxRuntime.startSession(desktopEnv)
+                    thread {
+                        linuxRuntime.startSession(desktopEnv, mode)
+                    }
+                    result.success(true)
+                }
+
+                "launchDesktopActivity" -> {
+                    val intent = Intent(this@MainActivity, com.droiddesk.droiddesk.view.DesktopActivity::class.java)
+                    startActivity(intent)
                     result.success(true)
                 }
 
@@ -107,18 +152,23 @@ class MainActivity : FlutterActivity() {
 
                 "executeCommand" -> {
                     val command = call.argument<String>("command") ?: ""
-                    thread(name = "execute-command") {
+                    Thread {
                         val output = linuxRuntime.executeCommand(command) { chunk ->
-                            runOnUiThread {
-                                flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                flutterEngine.dartExecutor.binaryMessenger.let { messenger ->
                                     MethodChannel(messenger, CHANNEL).invokeMethod("onTerminalOutput", mapOf("text" to chunk))
                                 }
                             }
                         }
-                        runOnUiThread {
+                        android.os.Handler(android.os.Looper.getMainLooper()).post {
                             result.success(output)
                         }
-                    }
+                    }.start()
+                }
+
+                "interruptCommand" -> {
+                    linuxRuntime.interruptCommand()
+                    result.success(true)
                 }
 
                 // ── System ──

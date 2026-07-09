@@ -19,6 +19,11 @@ class AppState extends ChangeNotifier {
   bool _isDownloading = false;
   bool _isExtracting = false;
   final bool _isInstallingDE = false;
+  String? _statusMessage;
+  
+  // Terminal history
+  final List<String> _terminalOutput = ['DroidDesk Linux Terminal\nType commands below.\n'];
+  List<String> get terminalOutput => _terminalOutput;
 
   // ── Device Info ──
   Map<String, dynamic> _deviceInfo = {};
@@ -37,6 +42,7 @@ class AppState extends ChangeNotifier {
   String get downloadStatus => _downloadStatus;
   double get extractProgress => _extractProgress;
   String get extractStatus => _extractStatus;
+  String? get statusMessage => _statusMessage;
   bool get isDownloading => _isDownloading;
   bool get isExtracting => _isExtracting;
   bool get isInstallingDE => _isInstallingDE;
@@ -84,6 +90,38 @@ class AppState extends ChangeNotifier {
           refreshStatus(); // Updates _isBootstrapped and completes setup
         }
       }
+      notifyListeners();
+    };
+
+    DroidDeskPlatform.onInstallProgress = (progress, status) {
+      _extractProgress = progress; // reusing extract progress state for UI
+      _extractStatus = status;
+      _statusMessage = status;
+      if (progress < 0) {
+        _isExtracting = false;
+        _errorMessage = status;
+      } else if (progress >= 1.0) {
+        if (_isExtracting) {
+          _isExtracting = false;
+        }
+      }
+      notifyListeners();
+    };
+
+    DroidDeskPlatform.onTerminalOutput = (text) {
+      if (_terminalOutput.isEmpty) _terminalOutput.add('');
+      
+      final cleanedText = text.replaceAll(RegExp(r'.*\r(?!\n)'), '');
+      final lines = cleanedText.split('\n');
+      
+      for (int i = 0; i < lines.length; i++) {
+        if (i == 0) {
+          _terminalOutput[_terminalOutput.length - 1] += lines[i];
+        } else {
+          _terminalOutput.add(lines[i]);
+        }
+      }
+      // Notify listeners to update terminal UI if open
       notifyListeners();
     };
 
@@ -170,16 +208,40 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<void> installDesktopEnvironment() async {
+    try {
+      _isExtracting = true; // Re-use the extracting state for UI purposes
+      _extractProgress = 0.0;
+      _statusMessage = 'Installing Desktop Environment...';
+      _errorMessage = null;
+      notifyListeners();
+      await DroidDeskPlatform.installDesktopEnvironment(_selectedDE);
+    } catch (e) {
+      _errorMessage = 'Installation failed: $e';
+      _isExtracting = false;
+      notifyListeners();
+    }
+  }
+
   // ── Session Control ──
 
-  Future<void> startLinux() async {
+  Future<void> startLinux({String mode = 'vnc'}) async {
     try {
       _errorMessage = null;
-      await DroidDeskPlatform.startLinux(de: _selectedDE);
+      await DroidDeskPlatform.startLinux(de: _selectedDE, mode: mode);
       _isRunning = true;
       notifyListeners();
     } catch (e) {
       _errorMessage = 'Failed to start: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> launchDesktopActivity() async {
+    try {
+      await DroidDeskPlatform.launchDesktopActivity();
+    } catch (e) {
+      _errorMessage = 'Failed to launch desktop activity: $e';
       notifyListeners();
     }
   }
@@ -197,9 +259,31 @@ class AppState extends ChangeNotifier {
 
   Future<String> executeCommand(String command) async {
     try {
+      _terminalOutput.add('\$ $command\n');
+      notifyListeners();
       return await DroidDeskPlatform.executeCommand(command);
     } catch (e) {
-      return 'Error: $e';
+      return "Error executing command: $e";
+    }
+  }
+
+  void appendTerminalOutput(String output) {
+    if (_terminalOutput.isEmpty) _terminalOutput.add('');
+    _terminalOutput[_terminalOutput.length - 1] += output;
+    notifyListeners();
+  }
+
+  void clearTerminal() {
+    _terminalOutput.clear();
+    _terminalOutput.add('DroidDesk Linux Terminal\nType commands below.\n');
+    notifyListeners();
+  }
+
+  Future<void> interruptCommand() async {
+    try {
+      await DroidDeskPlatform.interruptCommand();
+    } catch (e) {
+      debugPrint("Error interrupting command: $e");
     }
   }
 
