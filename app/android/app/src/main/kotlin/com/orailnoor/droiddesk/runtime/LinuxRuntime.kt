@@ -20,7 +20,7 @@ class LinuxRuntime(private val context: Context) {
     companion object {
         private const val TAG = "LinuxRuntime"
         private const val BOOTSTRAP_MARKER = ".bootstrap_extracted"
-        private const val SHEBANG_MARKER = ".shebangs_patched"
+        private const val SHEBANG_MARKER = ".relocated_text_paths_v2"
         private const val ELF_PATCH_MARKER = ".elf_runpaths_patched"
         private const val DE_MARKER = ".de_installed"
 
@@ -61,10 +61,20 @@ class LinuxRuntime(private val context: Context) {
         private const val D_TAG_OFFSET = 0
         private const val D_VAL_OFFSET = 8
         private const val DYN_SIZE = 16
+
+        // The desktop is launched from DesktopActivity but queried/stopped from
+        // MainActivity. Keep process ownership application-wide so both runtime
+        // wrappers operate on the same session.
+        @Volatile private var sessionProcess: Process? = null
+        @Volatile private var dbusProcess: Process? = null
     }
 
-    private var sessionProcess: Process? = null
     @Volatile private var activeCommandProcess: Process? = null
+    @Volatile private var installLogSink: ((String) -> Unit)? = null
+
+    fun setInstallLogSink(sink: ((String) -> Unit)?) {
+        installLogSink = sink
+    }
 
     // ── Base directories (all inside app's private storage) ──
 
@@ -72,8 +82,18 @@ class LinuxRuntime(private val context: Context) {
     private val prefixDir: File get() = File(baseDir, "usr")
     private val binDir: File get() = File(prefixDir, "bin")
     private val libDir: File get() = File(prefixDir, "lib")
-    private val tmpDir: File get() = File(prefixDir, "tmp")
+    // Shared with X11ServerService. X clients resolve /tmp/.X11-unix/X0 here
+    // through libsocket_hook, so this must not be $PREFIX/tmp.
+    private val tmpDir: File get() = File(baseDir, "tmp")
     private val homeDir: File get() = File(baseDir, "home")
+
+    /** Qualcomm exposes the Adreno render device through KGSL on Android. */
+    private fun hasAdrenoGpu(): Boolean = File("/dev/kgsl-3d0").exists()
+
+    private fun normalizedDesktop(desktopEnv: String): String = when (desktopEnv.lowercase()) {
+        "lxqt", "mate", "kde", "xfce4" -> desktopEnv.lowercase()
+        else -> "xfce4"
+    }
 
     // ── Status ──
 
@@ -86,8 +106,29 @@ class LinuxRuntime(private val context: Context) {
     }
 
     fun getInstalledDE(): String {
-        return if (File(prefixDir, DE_MARKER).exists() || File(prefixDir, "bin/startxfce4").exists()) "xfce4" else ""
+        val marker = File(prefixDir, DE_MARKER)
+        if (marker.exists()) return marker.readText().trim().ifEmpty { "xfce4" }
+        // Individual desktop binaries may already exist after a partially failed
+        // package transaction. Only the marker written at the end of the complete
+        // setup flow means the runtime is ready to launch.
+        return ""
     }
+
+    fun getGraphicsMode(): String {
+        val freedrenoIcd = File(prefixDir, "share/vulkan/icd.d/freedreno_icd.aarch64.json")
+        return if (hasAdrenoGpu() && freedrenoIcd.exists()) {
+            "Turnip + Zink"
+        } else {
+            "Software (llvmpipe)"
+        }
+    }
+
+    fun getOptionalAppsStatus(): Map<String, Boolean> = mapOf(
+        "firefox" to File(binDir, "firefox").exists(),
+        "code_oss" to (File(binDir, "code-oss").exists() || File(binDir, "code").exists()),
+        "nodejs" to (File(binDir, "node").exists() && File(binDir, "npm").exists()),
+        "imagemagick" to (File(binDir, "magick").exists() || File(binDir, "convert").exists()),
+    )
 
     // ── Bootstrap ──
 
@@ -233,6 +274,10 @@ class LinuxRuntime(private val context: Context) {
                 Dir::Bin::dpkg "${prefixDir.absolutePath}/bin/dpkg";
                 Dir::Bin::apt-key "${prefixDir.absolutePath}/bin/apt-key";
                 Acquire::gpgv::Options:: "--homedir=${prefixDir.absolutePath}/etc/apt/trusted.gpg.d";
+                Acquire::Retries "3";
+                Acquire::http::Timeout "30";
+                Acquire::https::Timeout "30";
+                DPkg::Lock::Timeout "60";
                 """.trimIndent()
             )
             Log.i(TAG, "Created apt config override at ${confFile.absolutePath}")
@@ -442,7 +487,13 @@ class LinuxRuntime(private val context: Context) {
                             if (n > 0) buf.copyOf(n) else ByteArray(0)
                         }
 
-                        if (bytes.size >= 2 && bytes[0] == '#'.code.toByte() && bytes[1] == '!'.code.toByte()) {
+                        val isScript = bytes.size >= 2 &&
+                            bytes[0] == '#'.code.toByte() && bytes[1] == '!'.code.toByte()
+                        val isPathConfig = file.extension.lowercase() in setOf(
+                            "service", "desktop", "conf", "xml", "pc", "cmake",
+                            "la", "prl", "sh", "pl", "py", "rb", "json", "ini",
+                        )
+                        if (isScript || isPathConfig) {
                             val content = file.readText()
                             if (content.contains(oldPrefix)) {
                                 val updated = content.replace(oldPrefix, newPrefix)
@@ -458,6 +509,51 @@ class LinuxRuntime(private val context: Context) {
         }
         markerFile.writeText("done")
         Log.i(TAG, "Patched $patchCount scripts.")
+    }
+
+    /** Relocate commands that Xfce compiled as absolute Termux paths. */
+    private fun patchEmbeddedXfcePaths() {
+        patchEmbeddedCommand(
+            File(prefixDir, "bin/xfce4-session"),
+            "/data/data/com.termux/files/usr/bin/iceauth",
+            "iceauth",
+        )
+        patchEmbeddedCommand(
+            File(prefixDir, "bin/xfce4-panel"),
+            "/data/data/com.termux/files/usr/lib/xfce4/panel/migrate",
+            "migrate",
+        )
+    }
+
+    private fun patchEmbeddedCommand(file: File, oldCommand: String, newCommand: String) {
+        if (!file.exists() || newCommand.length > oldCommand.length) return
+        val oldValue = oldCommand.toByteArray()
+        val newValue = newCommand.toByteArray()
+        val bytes = file.readBytes()
+        var patched = false
+        var offset = 0
+        while (offset <= bytes.size - oldValue.size) {
+            var matches = true
+            for (index in oldValue.indices) {
+                if (bytes[offset + index] != oldValue[index]) {
+                    matches = false
+                    break
+                }
+            }
+            if (matches) {
+                bytes.fill(0, offset, offset + oldValue.size)
+                newValue.copyInto(bytes, offset)
+                patched = true
+                offset += oldValue.size
+            } else {
+                offset++
+            }
+        }
+        if (patched) {
+            file.writeBytes(bytes)
+            file.setExecutable(true, false)
+            Log.i(TAG, "Relocated embedded command in ${file.name}: $newCommand")
+        }
     }
 
     // ── ELF RUNPATH/RPATH Patching ──
@@ -723,8 +819,18 @@ class LinuxRuntime(private val context: Context) {
         env["PREFIX"] = prefixDir.absolutePath
         env["TMPDIR"] = tmpDir.absolutePath
         env["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
-        env["PATH"] = "${prefixDir.absolutePath}/bin:${System.getenv("PATH")}"
+        env["PATH"] = listOf(
+            "${prefixDir.absolutePath}/bin",
+            "${prefixDir.absolutePath}/lib/xfce4/panel",
+            System.getenv("PATH") ?: "/system/bin",
+        ).joinToString(":")
         env["HOME"] = homeDir.absolutePath
+        // VTE-based terminals use SHELL to spawn their child process. Android's
+        // account database points at /system/bin/sh, which is not the relocated
+        // Termux userspace expected by XFCE Terminal.
+        env["SHELL"] = File(binDir, "bash").absolutePath
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
         env["LANG"] = "en_US.UTF-8"
 
         env["DISPLAY"] = ":0"
@@ -734,21 +840,30 @@ class LinuxRuntime(private val context: Context) {
         env["PYTHONHOME"] = prefixDir.absolutePath
         env["PIP_CONFIG_FILE"] = "${prefixDir.absolutePath}/etc/pip.conf"
         env["XDG_DATA_DIRS"] = "${prefixDir.absolutePath}/share"
-        env["XDG_CONFIG_DIRS"] = "${prefixDir.absolutePath}/etc/xdg"
+        // Xfce validates that its compile-time SYSCONFDIR is present literally,
+        // even though actual file access is relocated to this app's prefix.
+        env["XDG_CONFIG_DIRS"] = listOf(
+            "${prefixDir.absolutePath}/etc/xdg",
+            "${prefixDir.absolutePath}/etc",
+            "/data/data/com.termux/files/usr/etc",
+        ).joinToString(":")
         env["GDK_PIXBUF_MODULEDIR"] = "${prefixDir.absolutePath}/lib/gdk-pixbuf-2.0/2.10.0/loaders"
         env["GDK_PIXBUF_MODULE_FILE"] = "${prefixDir.absolutePath}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
 
-        // GPU acceleration for Adreno (Zink + Freedreno)
-        env["VK_ICD_FILENAMES"] = "${prefixDir.absolutePath}/share/vulkan/icd.d/freedreno_icd.aarch64.json"
+        // Mesa is always available. Adreno devices use Turnip + Zink for hardware
+        // rendering; other GPUs use Mesa's software renderer instead of being
+        // forced through an incompatible Freedreno Vulkan ICD.
         env["LIBGL_DRIVERS_PATH"] = "${prefixDir.absolutePath}/lib/dri"
-        env["MESA_LOADER_DRIVER_OVERRIDE"] = "zink"
-        env["GALLIUM_DRIVER"] = "zink"
-        env["MESA_GL_VERSION_OVERRIDE"] = "4.6"
-        env["MESA_GLES_VERSION_OVERRIDE"] = "3.2"
-        env["MESA_NO_ERROR"] = "1"
-        env["TU_DEBUG"] = "noconform"
-        env["ZINK_DESCRIPTORS"] = "lazy"
-        env["MESA_VK_WSI_PRESENT_MODE"] = "immediate"
+        val freedrenoIcd = File(prefixDir, "share/vulkan/icd.d/freedreno_icd.aarch64.json")
+        if (hasAdrenoGpu() && freedrenoIcd.exists()) {
+            env["VK_ICD_FILENAMES"] = freedrenoIcd.absolutePath
+            env["MESA_LOADER_DRIVER_OVERRIDE"] = "zink"
+            env["GALLIUM_DRIVER"] = "zink"
+        } else {
+            env["LIBGL_ALWAYS_SOFTWARE"] = "true"
+            env["MESA_LOADER_DRIVER_OVERRIDE"] = "llvmpipe"
+            env["GALLIUM_DRIVER"] = "llvmpipe"
+        }
 
         env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=${tmpDir.absolutePath}/dbus-session"
 
@@ -813,19 +928,99 @@ class LinuxRuntime(private val context: Context) {
         // pkg install downloads, unpacks and configures in one go. Newly unpacked
         // maintainer scripts still contain the original Termux shebang, so after
         // the command finishes (successfully or not) we patch them and run a
-        // configuration pass to finish any half-configured packages.
+        // configuration pass to finish any half-configured packages. The first
+        // command is therefore allowed to fail specifically when that recovery
+        // pass succeeds and all requested packages are present.
         Log.i(TAG, "Running: $cmd")
-        executeCommand(cmd)
+        val installOutput = executeCommand(cmd)
         patchShebangs(force = true)
         val configureOutput = executeCommand("dpkg --configure -a")
-        return !configureOutput.startsWith("Error:")
+        if (configureOutput.startsWith("Error:")) {
+            return false
+        }
+        if (!installOutput.startsWith("Error:")) {
+            return true
+        }
+
+        // A configure command is itself the recovery operation. If the patched
+        // second pass completed, dpkg has no remaining unconfigured packages.
+        if (cmd.startsWith("dpkg --configure")) {
+            Log.i(TAG, "dpkg configuration recovered after shebang patching")
+            return true
+        }
+
+        val installPrefix = "pkg install -y "
+        if (!cmd.startsWith(installPrefix)) {
+            return false
+        }
+
+        val requestedPackages = cmd.removePrefix(installPrefix).trim()
+        if (requestedPackages.isEmpty()) {
+            return false
+        }
+
+        // Do not mistake an unrelated successful `dpkg --configure -a` for a
+        // recovered install: every package requested by this group must now be
+        // registered in dpkg's database.
+        val queryOutput = executeCommand("dpkg-query -W $requestedPackages")
+        val recovered = !queryOutput.startsWith("Error:")
+        if (recovered) {
+            Log.i(TAG, "Package group recovered after shebang patching: $requestedPackages")
+        }
+        return recovered
     }
 
-    fun installDesktopEnvironmentNative(): Boolean {
+    /**
+     * Node.js currently ships a preinst script with Termux's absolute shebang.
+     * Preinst runs before dpkg exposes the script in its admin directory, so it
+     * must be relocated inside the deb before installation.
+     */
+    private fun installRelocatedNodejs(): Boolean {
+        val workDir = File(tmpDir, "nodejs-relocated-deb")
+        workDir.deleteRecursively()
+        workDir.mkdirs()
+
+        if (executeCommand("cd \"${workDir.absolutePath}\" && apt-get download nodejs")
+                .startsWith("Error:")) return false
+        val sourceDeb = workDir.listFiles()
+            ?.firstOrNull { it.name.startsWith("nodejs_") && it.extension == "deb" }
+            ?: return false
+        val unpacked = File(workDir, "unpacked")
+        if (executeCommand(
+                "dpkg-deb -R \"${sourceDeb.absolutePath}\" \"${unpacked.absolutePath}\""
+            ).startsWith("Error:")) return false
+
+        val oldPrefix = "/data/data/com.termux/files/usr"
+        val controlDir = File(unpacked, "DEBIAN")
+        controlDir.listFiles()?.filter { it.isFile }?.forEach { script ->
+            val content = script.readText()
+            if (content.contains(oldPrefix)) {
+                script.writeText(content.replace(oldPrefix, prefixDir.absolutePath))
+                script.setExecutable(true, false)
+            }
+        }
+
+        val rebuiltDeb = File(workDir, "nodejs-relocated.deb")
+        if (executeCommand(
+                "dpkg-deb -b \"${unpacked.absolutePath}\" \"${rebuiltDeb.absolutePath}\""
+            ).startsWith("Error:")) return false
+        if (executeCommand("dpkg --unpack \"${rebuiltDeb.absolutePath}\"")
+                .startsWith("Error:")) return false
+
+        patchShebangs(force = true)
+        return installPackageGroup("pkg install -y nodejs")
+    }
+
+    fun installDesktopEnvironmentNative(
+        desktopEnv: String = "xfce4",
+        onProgress: ((Double, String) -> Unit)? = null,
+    ): Boolean {
+        val selectedDesktop = normalizedDesktop(desktopEnv)
         val marker = File(prefixDir, DE_MARKER)
 
-        if (marker.exists()) {
-            Log.i(TAG, "Desktop environment already installed")
+        if (getInstalledDE() == selectedDesktop) {
+            onProgress?.invoke(1.0, "$selectedDesktop is already installed")
+            Log.i(TAG, "$selectedDesktop desktop environment already installed")
             return true
         }
 
@@ -837,6 +1032,7 @@ class LinuxRuntime(private val context: Context) {
         patchShebangs()
         patchElfRunpaths(prefixDir)
         compileSocketHook()
+        onProgress?.invoke(0.12, "Configuring X11 and TUR repositories...")
 
         // Install the x11/tur repository packages. Their postinst scripts run
         // `apt update`, which triggers SIGSYS under the app's seccomp filter, so we
@@ -846,6 +1042,7 @@ class LinuxRuntime(private val context: Context) {
             Log.e(TAG, "Failed to install x11-repo/tur-repo")
             return false
         }
+        onProgress?.invoke(0.24, "Updating native package database...")
 
         // Finish configuring anything left over from a previous run, then install
         // the desktop, GPU drivers, and build tools. Each install is followed by a
@@ -858,27 +1055,122 @@ class LinuxRuntime(private val context: Context) {
             Log.e(TAG, "pkg update failed")
             return false
         }
-        if (!installPackageGroup("pkg install -y xfce4 xfce4-terminal xfce4-whiskermenu-plugin thunar mousepad")) {
-            Log.e(TAG, "XFCE4 package install failed")
+        onProgress?.invoke(0.34, "Installing X11 and audio packages...")
+        // DroidDesk embeds the X server, so termux-x11-nightly is deliberately
+        // not installed. All desktops connect to the service's DISPLAY=:0.
+        if (!installPackageGroup("pkg install -y xorg-xrandr pulseaudio")) {
+            Log.e(TAG, "Native X11 runtime package install failed")
             return false
         }
-        if (!installPackageGroup("pkg install -y mesa-zink mesa-vulkan-icd-freedreno vulkan-loader-android")) {
-            Log.e(TAG, "Mesa/Vulkan package install failed")
+        onProgress?.invoke(0.46, "Installing $selectedDesktop desktop packages...")
+
+        val desktopPackages = when (selectedDesktop) {
+            "lxqt" -> "lxqt qterminal pcmanfm-qt featherpad"
+            "mate" -> "mate mate-terminal"
+            "kde" -> "plasma-desktop konsole dolphin"
+            else -> "xfce4 xfce4-terminal xfce4-whiskermenu-plugin xfce4-notifyd thunar mousepad"
+        }
+        if (!installPackageGroup("pkg install -y $desktopPackages")) {
+            Log.e(TAG, "$selectedDesktop package install failed")
             return false
         }
-        if (!installPackageGroup("pkg install -y clang")) {
-            Log.e(TAG, "clang package install failed")
-            return false
+        onProgress?.invoke(0.70, "Installing Mesa graphics packages...")
+
+        // mesa-zink pulls the Vulkan loader selected by the active Termux repo.
+        // Current repositories use vulkan-loader-generic, which provides and
+        // conflicts with the older vulkan-loader-android package name.
+        if (!installPackageGroup("pkg install -y mesa-zink")) {
+            // Graphics acceleration is optional. A desktop with llvmpipe is much
+            // better UX than failing setup because a vendor Vulkan stack is not
+            // compatible with the current Mesa package set.
+            Log.w(TAG, "Mesa/Zink install unavailable; continuing with software rendering")
+            installPackageGroup("dpkg --configure -a")
         }
 
-        marker.writeText("done")
-        Log.i(TAG, "Desktop environment installation complete")
+        // Turnip/Freedreno is the hardware path for Qualcomm Adreno. Do not
+        // install or force that ICD on Mali/PowerVR devices.
+        if (hasAdrenoGpu()) {
+            onProgress?.invoke(0.78, "Installing Adreno hardware acceleration...")
+            installPackageGroup("pkg install -y mesa-vulkan-icd-freedreno")
+        }
+
+        val nativeTools = "git wget curl openssh htop python clang"
+        onProgress?.invoke(
+            0.84,
+            "Installing Desktop Essentials tools...",
+        )
+        if (!installPackageGroup("pkg install -y $nativeTools")) {
+            Log.e(TAG, "Native Termux utility package install failed")
+            return false
+        }
+        onProgress?.invoke(0.94, "Finalizing native Linux environment...")
+
+        // Rebuild the hook with the installed clang, then persist the selected DE.
+        compileSocketHook()
+        patchEmbeddedXfcePaths()
+        marker.writeText(selectedDesktop)
+        onProgress?.invoke(1.0, "Native Linux setup complete")
+        Log.i(TAG, "Native Termux $selectedDesktop installation complete")
         return true
+    }
+
+    fun installOptionalApp(
+        appId: String,
+        onProgress: ((Double, String) -> Unit)? = null,
+    ): Boolean {
+        if (getInstalledDE().isEmpty()) return false
+        if (getOptionalAppsStatus()[appId] == true) {
+            onProgress?.invoke(1.0, "Already installed")
+            return true
+        }
+
+        // Code OSS can pull npm, and npm can be left unpacked while Node's
+        // original Termux preinst path is invalid in our relocated prefix.
+        // Repair/install Node before the generic dpkg configure pass.
+        if (appId == "nodejs" || appId == "code_oss") {
+            onProgress?.invoke(0.08, "Preparing relocated Node.js dependency...")
+            if (!File(binDir, "node").exists() && !installRelocatedNodejs()) return false
+        }
+
+        onProgress?.invoke(0.18, "Repairing interrupted packages...")
+        if (!installPackageGroup("dpkg --configure -a")) return false
+
+        val ok = when (appId) {
+            "firefox" -> {
+                onProgress?.invoke(0.25, "Installing Firefox...")
+                installPackageGroup("pkg install -y firefox")
+            }
+            "code_oss" -> {
+                onProgress?.invoke(0.45, "Installing npm dependency...")
+                installPackageGroup("pkg install -y npm") && run {
+                    onProgress?.invoke(0.65, "Installing Code OSS...")
+                    installPackageGroup("pkg install -y code-oss")
+                }
+            }
+            "nodejs" -> {
+                onProgress?.invoke(0.65, "Installing npm...")
+                installPackageGroup("pkg install -y npm")
+            }
+            "imagemagick" -> {
+                onProgress?.invoke(0.25, "Installing ImageMagick...")
+                installPackageGroup("pkg install -y imagemagick")
+            }
+            else -> false
+        }
+
+        if (ok) {
+            patchShebangs(force = true)
+            onProgress?.invoke(1.0, "Installation complete")
+        } else {
+            onProgress?.invoke(-1.0, "Installation failed. Review the package log and retry.")
+        }
+        return ok
     }
 
     // ── Session Management ──
 
     fun startSession(desktopEnv: String = "xfce4", mode: String = "x11", width: Int = 1920, height: Int = 1080) {
+        val selectedDesktop = normalizedDesktop(desktopEnv)
         extractBootstrapIfNeeded(context)
 
         if (isRunning()) {
@@ -894,25 +1186,30 @@ class LinuxRuntime(private val context: Context) {
         patchShebangs()
         patchElfRunpaths(prefixDir)
         compileSocketHook()
+        patchEmbeddedXfcePaths()
 
-        val oldSocket = File(tmpDir, ".X11-unix/X0")
-        if (oldSocket.exists()) {
-            oldSocket.delete()
-            Log.i(TAG, "Deleted stale X11 socket file before launching session")
-        }
+        // X11ServerService owns this socket. Never delete it from the client runtime.
+        File(tmpDir, ".X11-unix").mkdirs()
 
-        // Start a session dbus-daemon if available
+        // Remove stale Xfce ICE listeners left by a killed/restarted activity.
+        tmpDir.listFiles { file -> file.name.startsWith(".xfsm-ICE-") }
+            ?.forEach { it.delete() }
+
+        // Start a session dbus-daemon and keep it as a child process. Do not use
+        // --fork: a forked daemon can outlive the Android activity and leave an
+        // orphaned bus behind after its socket is replaced.
         val dbusSocket = File(tmpDir, "dbus-session")
         try {
+            dbusProcess?.destroyForcibly()
             if (dbusSocket.exists()) dbusSocket.delete()
             val dbusCmd = listOf(
                 File(prefixDir, "bin/dbus-daemon").absolutePath,
                 "--session",
                 "--address=unix:path=${dbusSocket.absolutePath}",
-                "--fork",
+                "--nofork",
                 "--nopidfile"
             )
-            ProcessBuilder(dbusCmd)
+            val startedDbus = ProcessBuilder(dbusCmd)
                 .directory(homeDir.apply { mkdirs() })
                 .redirectErrorStream(true)
                 .also { pb ->
@@ -920,9 +1217,40 @@ class LinuxRuntime(private val context: Context) {
                     pb.environment().putAll(getTermuxEnv())
                 }
                 .start()
-            Log.i(TAG, "Started session dbus-daemon")
+            dbusProcess = startedDbus
+
+            Thread {
+                try {
+                    startedDbus.inputStream.bufferedReader().forEachLine {
+                        Log.d(TAG, "DBUS: $it")
+                    }
+                } catch (error: java.io.IOException) {
+                    // Closing the pipe is expected when Stop Server terminates dbus.
+                    Log.d(TAG, "D-Bus output stream closed")
+                }
+            }.start()
+
+            val readyDeadline = System.currentTimeMillis() + 2_000
+            while (!dbusSocket.exists() && startedDbus.isAlive &&
+                System.currentTimeMillis() < readyDeadline) {
+                Thread.sleep(20)
+            }
+            check(dbusSocket.exists() && startedDbus.isAlive) {
+                "dbus-daemon did not create its session socket"
+            }
+            Log.i(TAG, "Session dbus-daemon ready")
         } catch (e: Exception) {
-            Log.w(TAG, "dbus-daemon start failed, falling back to dbus-launch: ${e.message}")
+            Log.e(TAG, "dbus-daemon start failed: ${e.message}")
+            dbusProcess?.destroyForcibly()
+            dbusProcess = null
+            return
+        }
+
+        val desktopCommand = when (selectedDesktop) {
+            "lxqt" -> "startlxqt"
+            "mate" -> "mate-session"
+            "kde" -> "startplasma-x11"
+            else -> "startxfce4"
         }
 
         val runScript = """
@@ -934,22 +1262,19 @@ class LinuxRuntime(private val context: Context) {
             # Use the session bus DroidDesk already started
             export DBUS_SESSION_BUS_ADDRESS="unix:path=${dbusSocket.absolutePath}"
 
-            # Launch XFCE4 Session natively
-            echo "DIAG: Launching startxfce4 natively on DISPLAY=:0 ..."
+            # Native Termux audio; no VNC server or secondary display is involved.
+            pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
 
-            if [ -x "${prefixDir.absolutePath}/bin/startxfce4" ]; then
-                exec startxfce4
-            else
-                exec xfce4-session
-            fi
+            echo "DIAG: Launching $desktopCommand natively on DISPLAY=:0 ..."
+            exec $desktopCommand
         """.trimIndent()
 
-        Log.i(TAG, "Starting native Termux session for $desktopEnv")
+        Log.i(TAG, "Starting native Termux session for $selectedDesktop")
 
         val bashBin = File(prefixDir, "bin/bash").absolutePath
         val command = listOf(bashBin, "-c", runScript)
 
-        sessionProcess = ProcessBuilder(command)
+        val startedSession = ProcessBuilder(command)
             .directory(homeDir.apply { mkdirs() })
             .redirectErrorStream(true)
             .also { pb ->
@@ -957,13 +1282,19 @@ class LinuxRuntime(private val context: Context) {
                 pb.environment().putAll(getTermuxEnv())
             }
             .start()
+        sessionProcess = startedSession
 
         Thread {
-            val reader = java.io.InputStreamReader(sessionProcess!!.inputStream)
-            val buffer = CharArray(1024)
-            var charsRead: Int
-            while (reader.read(buffer).also { charsRead = it } != -1) {
-                Log.d(TAG, "DESKTOP: " + String(buffer, 0, charsRead))
+            try {
+                val reader = java.io.InputStreamReader(startedSession.inputStream)
+                val buffer = CharArray(1024)
+                var charsRead: Int
+                while (reader.read(buffer).also { charsRead = it } != -1) {
+                    Log.d(TAG, "DESKTOP: " + String(buffer, 0, charsRead))
+                }
+            } catch (error: java.io.IOException) {
+                // destroyForcibly() closes the pipe during a normal shutdown.
+                Log.d(TAG, "Desktop output stream closed")
             }
         }.start()
 
@@ -977,6 +1308,8 @@ class LinuxRuntime(private val context: Context) {
             it.waitFor()
         }
         sessionProcess = null
+        dbusProcess?.destroyForcibly()
+        dbusProcess = null
         Log.i(TAG, "Session stopped")
     }
 
@@ -1024,6 +1357,7 @@ class LinuxRuntime(private val context: Context) {
                 val chunk = String(buffer, 0, charsRead)
                 Log.d(TAG, "CHUNK: $chunk")
                 output.append(chunk)
+                installLogSink?.invoke(chunk)
                 onOutput?.invoke(chunk)
             }
             process.waitFor()

@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
-import 'package:droiddesk/screens/setup/install_type_picker.dart';
+import 'package:droiddesk/screens/setup/de_picker.dart';
 
 /// Welcome screen — first thing the user sees.
 /// Premium, animated landing with the DroidDesk brand.
@@ -113,7 +113,7 @@ class WelcomeScreen extends StatelessWidget {
                             ),
                             _featureChip(
                               Icons.security_rounded,
-                              'Root = H/A',
+                              'Root Optional',
                             ),
                             _featureChip(
                               Icons.desktop_mac_rounded,
@@ -141,7 +141,7 @@ class WelcomeScreen extends StatelessWidget {
                             PageRouteBuilder(
                               pageBuilder:
                                   (context, animation, secondaryAnimation) =>
-                                      const InstallTypePickerScreen(),
+                                      const DEPickerScreen(),
                               transitionsBuilder:
                                   (
                                     context,
@@ -149,11 +149,11 @@ class WelcomeScreen extends StatelessWidget {
                                     secondaryAnimation,
                                     child,
                                   ) {
-                                return FadeTransition(
-                                  opacity: animation,
-                                  child: SlideTransition(
-                                    position:
-                                        Tween<Offset>(
+                                    return FadeTransition(
+                                      opacity: animation,
+                                      child: SlideTransition(
+                                        position:
+                                            Tween<Offset>(
                                               begin: const Offset(0, 0.05),
                                               end: Offset.zero,
                                             ).animate(
@@ -162,10 +162,10 @@ class WelcomeScreen extends StatelessWidget {
                                                 curve: Curves.easeOut,
                                               ),
                                             ),
-                                    child: child,
-                                  ),
-                                );
-                              },
+                                        child: child,
+                                      ),
+                                    );
+                                  },
                               transitionDuration: const Duration(
                                 milliseconds: 400,
                               ),
@@ -183,7 +183,7 @@ class WelcomeScreen extends StatelessWidget {
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
                             Text(
-                              'Install Ubuntu',
+                              'Set Up Desktop Essentials',
                               style: DroidTheme.headingSm.copyWith(
                                 color: Colors.white,
                               ),

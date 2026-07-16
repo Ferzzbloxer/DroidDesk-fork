@@ -440,6 +440,13 @@ public class LorieView extends SurfaceView implements InputStub {
             LorieView.this.sendKeyEvent(0, k, false);
         }
 
+        @Override public boolean performEditorAction(int actionCode) {
+            // Android IMEs normally deliver the return key as an editor action,
+            // not as committed text. X11 needs a real Return press/release.
+            sendKey(KeyEvent.KEYCODE_ENTER);
+            return true;
+        }
+
         @Override public boolean deleteSurroundingText(int beforeLength, int afterLength) {
             if (requestedPos != -1 && requestedPos > currentPos && beforeLength > 0) {
                 // sometimes gboard sees following whitespace and wants to remove it.
@@ -466,6 +473,10 @@ public class LorieView extends SurfaceView implements InputStub {
                 resetCursorPosition = true;
 
             return true;
+        }
+
+        @Override public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+            return deleteSurroundingText(beforeLength, afterLength);
         }
 
         /**
@@ -525,6 +536,13 @@ public class LorieView extends SurfaceView implements InputStub {
 
         @Override
         public boolean commitText(CharSequence text, int newPos) {
+            // Some keyboards commit a newline instead of invoking an editor
+            // action. Treat a standalone newline as the X11 Return key.
+            if ("\n".contentEquals(text) || "\r\n".contentEquals(text)) {
+                sendKey(KeyEvent.KEYCODE_ENTER);
+                currentComposingText = null;
+                return true;
+            }
             Log.d("InputConnectionWrapper", newPos + " - 1 + " + currentPos + " + " + text.length());
             Log.d("InputConnectionWrapper", "OLD " + currentPos + " NEW " + Math.max(1, newPos - 1 + currentPos + text.length()) + " mBatchEditNesting " + mBatchEditNesting);
             if (newPos > 0)
@@ -547,7 +565,18 @@ public class LorieView extends SurfaceView implements InputStub {
 
         @Override
         public boolean sendKeyEvent(KeyEvent event) {
-            return LorieView.this.dispatchKeyEvent(event);
+            // Route special IME and hardware keys through the same input state
+            // machine used by Termux:X11. Fall back to direct native injection
+            // while the controller is being attached.
+            if (a.handleKey(event))
+                return true;
+            if (event.getAction() == KeyEvent.ACTION_DOWN || event.getAction() == KeyEvent.ACTION_UP)
+                return LorieView.this.sendKeyEvent(
+                        event.getScanCode(),
+                        event.getKeyCode(),
+                        event.getAction() == KeyEvent.ACTION_DOWN
+                );
+            return false;
         }
 
         @Override
@@ -568,9 +597,6 @@ public class LorieView extends SurfaceView implements InputStub {
         @Override public void surfaceCreated(@NonNull SurfaceHolder holder) {
             holder.setFormat(PixelFormat.BGRA_8888);
             Log.i("LorieView", "surfaceCreated called!");
-            new Handler(Looper.getMainLooper()).post(() -> {
-                android.widget.Toast.makeText(getContext(), "LorieView Surface Created!", android.widget.Toast.LENGTH_SHORT).show();
-            });
             MainActivity.handler.post(() -> {
                 if (MainActivity.getInstance() != null) {
                     LorieView.this.surfaceChanged(holder.getSurface());
@@ -581,11 +607,6 @@ public class LorieView extends SurfaceView implements InputStub {
 
         @Override public void surfaceChanged(@NonNull SurfaceHolder holder, int f, int width, int height) {
             Log.i("LorieView", "surfaceChanged called with width=" + width + ", height=" + height);
-            final int finalWidth = width;
-            final int finalHeight = height;
-            new Handler(Looper.getMainLooper()).post(() -> {
-                android.widget.Toast.makeText(getContext(), "Surface Changed! " + finalWidth + "x" + finalHeight, android.widget.Toast.LENGTH_SHORT).show();
-            });
             LorieView.this.surfaceChanged(holder.getSurface());
             width = getMeasuredWidth();
             height = getMeasuredHeight();

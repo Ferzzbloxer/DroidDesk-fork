@@ -73,6 +73,10 @@ class X11ServiceClient(
     fun connect() {
         if (!active.compareAndSet(false, true)) return
         val intent = Intent(appContext, X11ServerService::class.java)
+        // A bound-only service is destroyed as soon as DesktopActivity goes
+        // away. Keep the isolated X server started while the Linux session is
+        // running so returning to the desktop can reuse the live connection.
+        appContext.startService(intent)
         bound = appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE)
         if (!bound) postError("Android refused the X11 service binding", null)
     }

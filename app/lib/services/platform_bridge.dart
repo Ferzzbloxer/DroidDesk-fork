@@ -12,6 +12,7 @@ class DroidDeskPlatform {
   static Function(double progress, String status)? onDownloadProgress;
   static Function(double progress, String status)? onExtractProgress;
   static Function(double progress, String status)? onInstallProgress;
+  static Function(double progress, String status)? onOptionalInstallProgress;
   static Function(String text)? onTerminalOutput;
 
   /// Initialize platform channel listeners
@@ -43,6 +44,13 @@ class DroidDeskPlatform {
           final args = call.arguments as Map;
           onTerminalOutput?.call(args['text'] as String);
           break;
+        case 'onOptionalInstallProgress':
+          final args = call.arguments as Map;
+          onOptionalInstallProgress?.call(
+            (args['progress'] as num).toDouble(),
+            args['status'] as String,
+          );
+          break;
       }
     });
   }
@@ -69,8 +77,10 @@ class DroidDeskPlatform {
 
   // ── Native Desktop Environment Installation (non-root fallback) ──
 
-  static Future<bool> installDesktopNative() async {
-    final result = await _channel.invokeMethod('installDesktopNative');
+  static Future<bool> installDesktopNative({String de = 'xfce4'}) async {
+    final result = await _channel.invokeMethod('installDesktopNative', {
+      'de': de,
+    });
     return result as bool? ?? false;
   }
 
@@ -87,35 +97,51 @@ class DroidDeskPlatform {
 
   // ── Rootfs Management (chroot mode) ──
 
-  static Future<void> downloadRootfs(String distro) async {
-    await _channel.invokeMethod('downloadRootfs', {'distro': distro});
+  static Future<bool> downloadRootfs(String distro) async {
+    return await _channel.invokeMethod<bool>('downloadRootfs', {
+          'distro': distro,
+        }) ??
+        false;
   }
 
-  static Future<void> extractRootfs() async {
-    await _channel.invokeMethod('extractRootfs');
+  static Future<bool> extractRootfs() async {
+    return await _channel.invokeMethod<bool>('extractRootfs') ?? false;
   }
 
-  static Future<void> installDesktopEnvironment(String de, {String type = 'minimal'}) async {
-    await _channel.invokeMethod('installDesktopEnvironment', {
-      'de': de,
-      'type': type,
-    });
+  static Future<bool> installDesktopEnvironment(String de) async {
+    return await _channel.invokeMethod<bool>('installDesktopEnvironment', {
+          'de': de,
+        }) ??
+        false;
+  }
+
+  static Future<Map<String, bool>> getOptionalApps() async {
+    final result = await _channel.invokeMethod('getOptionalApps');
+    return Map<String, bool>.from(result);
+  }
+
+  static Future<bool> installOptionalApp(String appId) async {
+    return await _channel.invokeMethod<bool>('installOptionalApp', {
+          'appId': appId,
+        }) ??
+        false;
   }
 
   // ── Linux Session ──
 
-  static Future<void> startLinux({
+  static Future<bool> startLinux({
     String de = 'xfce4',
     String mode = 'x11',
     int width = 1920,
     int height = 1080,
   }) async {
-    await _channel.invokeMethod('startLinux', {
-      'de': de,
-      'mode': mode,
-      'width': width,
-      'height': height,
-    });
+    return await _channel.invokeMethod<bool>('startLinux', {
+          'de': de,
+          'mode': mode,
+          'width': width,
+          'height': height,
+        }) ??
+        false;
   }
 
   static Future<void> stopLinux() async {

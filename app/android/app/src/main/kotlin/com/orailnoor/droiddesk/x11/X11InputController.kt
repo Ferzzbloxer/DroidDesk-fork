@@ -19,6 +19,7 @@ class X11InputController(private val lorieView: LorieView) {
 
     init {
         setMode(mode)
+        MainActivity.getInstance().setKeyHandler(inputHandler::sendKeyEvent)
         lorieView.setCallback { width, height, transform ->
             inputHandler.handleInputTransformChanged(width, height, transform)
         }
@@ -43,6 +44,7 @@ class X11InputController(private val lorieView: LorieView) {
     }
 
     fun dispose() {
+        MainActivity.getInstance().setKeyHandler(null)
         lorieView.setOnTouchListener(null)
         lorieView.setOnGenericMotionListener(null)
         lorieView.setCallback(null)
@@ -59,7 +61,7 @@ class X11InputController(private val lorieView: LorieView) {
         inputHandler.handleTouchEvent(lorieView, view, event)
 
     companion object {
-        const val DISPLAY_SCALE_PERCENT = 150
+        const val DISPLAY_SCALE_PERCENT = 200
 
         /** Must run before LorieView is measured so Xwayland starts at the scaled resolution. */
         fun configureDisplayScale() {

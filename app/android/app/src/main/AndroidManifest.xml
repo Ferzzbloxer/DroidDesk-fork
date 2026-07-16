@@ -23,7 +23,6 @@
     <application
         android:label="DroidDesk"
         android:name="${applicationName}"
-        android:extractNativeLibs="true"
         android:icon="@mipmap/launcher_icon"
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true"
@@ -53,7 +52,8 @@
         <activity
             android:name=".view.DesktopActivity"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-            android:launchMode="singleTask"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
 
         <!-- The native X server must have a different Linux process and FD table than LorieView. -->
@@ -63,7 +63,7 @@
             android:exported="false"
             android:process=":x11" />
 
-        <!-- Foreground Service: keeps proot + compositor alive -->
+        <!-- Foreground Service: keeps the chroot or native Termux session alive -->
         <service
             android:name=".service.DroidDeskService"
             android:enabled="true"

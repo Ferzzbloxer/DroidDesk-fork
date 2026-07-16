@@ -14,6 +14,10 @@ public class MainActivity extends Activity {
     public static final String ACTION_CUSTOM = "com.termux.x11.ACTION_CUSTOM";
     
     private LorieView lorieView;
+    public interface KeyHandler {
+        boolean handle(KeyEvent event);
+    }
+    private KeyHandler keyHandler;
 
     public boolean useTermuxEKBarBehaviour = false;
     public static class DummyExtraKeys {
@@ -81,7 +85,14 @@ public class MainActivity extends Activity {
     }
     
     public boolean handleKey(KeyEvent event) {
-        return false;
+        // Let Android dismiss the soft keyboard and handle system navigation.
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK)
+            return false;
+        return keyHandler != null && keyHandler.handle(event);
+    }
+
+    public void setKeyHandler(KeyHandler handler) {
+        keyHandler = handler;
     }
 
     // JNI STUBS

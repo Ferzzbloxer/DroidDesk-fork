@@ -52,9 +52,20 @@ class X11ServerService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // The Linux foreground service owns user-visible session persistence.
+        // Do not resurrect X11 by itself after Stop Server or an app shutdown.
+        return START_NOT_STICKY
+    }
+
     override fun onDestroy() {
+        Log.i(TAG, "Stopping dedicated X11 service process")
         serverThread.quitSafely()
         super.onDestroy()
+        // libXlorie owns native threads that are not stopped by destroying the
+        // Android Service object. This process hosts X11 only, so terminate it
+        // to guarantee the next launch receives a clean server and socket.
+        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     private fun ensureServerStarted(): Boolean {

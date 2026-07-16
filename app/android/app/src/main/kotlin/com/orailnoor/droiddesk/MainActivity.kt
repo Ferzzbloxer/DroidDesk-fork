@@ -15,8 +15,10 @@ import com.orailnoor.droiddesk.runtime.LinuxRuntime
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
 import com.orailnoor.droiddesk.runtime.RootShell
 import com.orailnoor.droiddesk.view.AndroidSurfaceViewFactory
+import com.orailnoor.droiddesk.x11.X11ServerService
 import kotlin.concurrent.thread
 import android.util.Log
+import android.widget.Toast
 
 class MainActivity : FlutterActivity() {
 
@@ -87,7 +89,6 @@ class MainActivity : FlutterActivity() {
                     var inOk = false
                     chrootRuntime.installDesktopEnvironment(
                         desktopEnv = "xfce4",
-                        installType = "minimal",
                         onProgress = { progress, _ ->
                             if (progress >= 1.0 || progress < 0) {
                                 inOk = progress >= 1.0
@@ -156,6 +157,11 @@ class MainActivity : FlutterActivity() {
                         "sdkVersion" to Build.VERSION.SDK_INT,
                         "cpuAbi" to Build.SUPPORTED_ABIS.firstOrNull(),
                         "gpuVendor" to getGpuVendor(),
+                        "graphicsMode" to if (chrootRuntime.hasRoot()) {
+                            "Software (llvmpipe)"
+                        } else {
+                            linuxRuntime.getGraphicsMode()
+                        },
                         "totalRamMB" to getTotalRam(),
                         "availableStorageMB" to getAvailableStorage()
                     ))
@@ -231,14 +237,12 @@ class MainActivity : FlutterActivity() {
 
                 "installDesktopEnvironment" -> {
                     val desktopEnv = call.argument<String>("de") ?: "xfce4"
-                    val installType = call.argument<String>("type") ?: "minimal"
                     thread {
                         try {
                             val latch = java.util.concurrent.CountDownLatch(1)
                             var success = false
                             chrootRuntime.installDesktopEnvironment(
                                 desktopEnv,
-                                installType,
                                 { progress, status ->
                                     runOnUiThread {
                                         flutterEngine.dartExecutor.binaryMessenger.let { messenger ->
@@ -274,8 +278,70 @@ class MainActivity : FlutterActivity() {
 
                 // ── Native Termux desktop install (non-root fallback) ──
                 "installDesktopNative" -> {
+                    val desktopEnv = call.argument<String>("de") ?: "xfce4"
                     thread {
-                        val ok = linuxRuntime.installDesktopEnvironmentNative()
+                        linuxRuntime.setInstallLogSink { chunk ->
+                            runOnUiThread {
+                                MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                                    .invokeMethod("onTerminalOutput", mapOf("text" to chunk))
+                            }
+                        }
+                        try {
+                            val ok = linuxRuntime.installDesktopEnvironmentNative(
+                                desktopEnv,
+                            ) { progress, status ->
+                                runOnUiThread {
+                                    MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod(
+                                        "onInstallProgress",
+                                        mapOf("progress" to progress, "status" to status),
+                                    )
+                                }
+                            }
+                            runOnUiThread { result.success(ok) }
+                        } finally {
+                            linuxRuntime.setInstallLogSink(null)
+                        }
+                    }
+                }
+
+                "getOptionalApps" -> {
+                    val status = if (chrootRuntime.hasRoot()) {
+                        chrootRuntime.getOptionalAppsStatus()
+                    } else {
+                        linuxRuntime.getOptionalAppsStatus()
+                    }
+                    result.success(status)
+                }
+
+                "installOptionalApp" -> {
+                    val appId = call.argument<String>("appId") ?: ""
+                    thread {
+                        val logSink: (String) -> Unit = { chunk ->
+                            runOnUiThread {
+                                MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                                    .invokeMethod("onTerminalOutput", mapOf("text" to chunk))
+                            }
+                        }
+                        val progressSink: (Double, String) -> Unit = { progress, status ->
+                            runOnUiThread {
+                                MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                                    .invokeMethod(
+                                        "onOptionalInstallProgress",
+                                        mapOf("progress" to progress, "status" to status),
+                                    )
+                            }
+                        }
+
+                        val ok = if (chrootRuntime.hasRoot()) {
+                            chrootRuntime.installOptionalApp(appId, progressSink, logSink)
+                        } else {
+                            linuxRuntime.setInstallLogSink(logSink)
+                            try {
+                                linuxRuntime.installOptionalApp(appId, progressSink)
+                            } finally {
+                                linuxRuntime.setInstallLogSink(null)
+                            }
+                        }
                         runOnUiThread { result.success(ok) }
                     }
                 }
@@ -300,6 +366,7 @@ class MainActivity : FlutterActivity() {
                         thread {
                             if (!chrootRuntime.isRootfsReady()) {
                                 Log.w(TAG, "Chroot rootfs not ready; cannot start session")
+                                runOnUiThread { result.success(false) }
                                 return@thread
                             }
                             runOnUiThread {
@@ -309,23 +376,39 @@ class MainActivity : FlutterActivity() {
                                     putExtra("de", desktopEnv)
                                 }
                                 startActivity(intent)
+                                result.success(true)
                             }
                         }
                     } else {
                         // Non-root fallback: native Termux path
                         thread {
                             linuxRuntime.extractBootstrapIfNeeded(applicationContext)
-                            linuxRuntime.installDesktopEnvironmentNative()
+                            val installed = linuxRuntime.getInstalledDE()
+                            val ready = installed == desktopEnv ||
+                                linuxRuntime.installDesktopEnvironmentNative(desktopEnv)
+                            if (!ready) {
+                                Log.e(TAG, "Native Termux desktop setup failed; session was not launched")
+                                runOnUiThread {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "Native Linux setup failed. Check the setup log.",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                    result.success(false)
+                                }
+                                return@thread
+                            }
                             runOnUiThread {
                                 val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
                                     putExtra("startSession", true)
                                     putExtra("mode", "termux")
+                                    putExtra("de", desktopEnv)
                                 }
                                 startActivity(intent)
+                                result.success(true)
                             }
                         }
                     }
-                    result.success(true)
                 }
 
                 "launchDesktopActivity" -> {
@@ -335,12 +418,15 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "stopLinux" -> {
-                    if (chrootRuntime.hasRoot()) {
-                        chrootRuntime.stopSession()
+                    thread(name = "stop-linux-session") {
+                        if (chrootRuntime.hasRoot() || chrootRuntime.isRunning()) {
+                            chrootRuntime.stopSession()
+                        }
+                        linuxRuntime.stopSession()
+                        stopService(Intent(this@MainActivity, X11ServerService::class.java))
+                        stopForegroundService()
+                        runOnUiThread { result.success(true) }
                     }
-                    linuxRuntime.stopSession()
-                    stopForegroundService()
-                    result.success(true)
                 }
 
                 // ── Command execution ──
@@ -390,9 +476,11 @@ class MainActivity : FlutterActivity() {
                         // Nothing to bootstrap for chroot; rootfs handles it
                         result.success(true)
                     } else {
-                        linuxRuntime.extractBootstrapIfNeeded(applicationContext)
-                        linuxRuntime.setupBootstrap()
-                        result.success(true)
+                        thread {
+                            linuxRuntime.extractBootstrapIfNeeded(applicationContext)
+                            linuxRuntime.setupBootstrap()
+                            runOnUiThread { result.success(true) }
+                        }
                     }
                 }
 

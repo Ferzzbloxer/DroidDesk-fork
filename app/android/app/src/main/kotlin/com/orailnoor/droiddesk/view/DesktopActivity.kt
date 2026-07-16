@@ -6,7 +6,12 @@ import android.graphics.Color
 import android.view.Window
 import android.view.WindowManager
 import android.view.SurfaceHolder
+import android.view.ViewGroup
+import android.view.View
+import android.view.MotionEvent
+import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.util.Log
 import android.widget.Toast
 import android.widget.Button
@@ -32,6 +37,9 @@ class DesktopActivity : Activity() {
     private var x11ServiceClient: X11ServiceClient? = null
     private var inputController: X11InputController? = null
     private var inputModeButton: Button? = null
+    private var controlOverlay: LinearLayout? = null
+    private var collapsedControl: Button? = null
+    private var surfaceCallback: SurfaceHolder.Callback? = null
 
     companion object {
         private const val TAG = "DesktopActivity"
@@ -82,11 +90,15 @@ class DesktopActivity : Activity() {
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         )
+        // TermuxMainActivity retains its LorieView singleton across activity
+        // recreation. Detach it from the previous activity's container before
+        // attaching it here, otherwise Android throws "child already has a parent".
+        (lorieView!!.parent as? ViewGroup)?.removeView(lorieView)
         placeholder.addView(lorieView, params)
         Log.i(TAG, "LorieView added to placeholder")
 
         // Start X server only after the Surface is actually created/changed.
-        lorieView!!.holder.addCallback(object : SurfaceHolder.Callback {
+        surfaceCallback = object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 Log.i(TAG, "LorieView surfaceCreated")
             }
@@ -94,7 +106,7 @@ class DesktopActivity : Activity() {
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
                 Log.i(TAG, "LorieView surfaceChanged ${width}x${height}")
                 synchronized(this@DesktopActivity) {
-                    if (!connectionRequested && !LorieView.connected()) {
+                    if (!connectionRequested) {
                         connectionRequested = true
                         connectToX11Service()
                     }
@@ -104,12 +116,12 @@ class DesktopActivity : Activity() {
             override fun surfaceDestroyed(holder: SurfaceHolder) {
                 Log.i(TAG, "LorieView surfaceDestroyed")
             }
-        })
+        }.also { lorieView!!.holder.addCallback(it) }
     }
 
     private fun connectToX11Service() {
         if (LorieView.connected()) {
-            lorieView?.requestFocus()
+            attachDesktopInput()
             return
         }
 
@@ -121,10 +133,7 @@ class DesktopActivity : Activity() {
                     logcatFd?.let { LorieView.startLogcat(it.detachFd()) }
                     Log.i(TAG, "LorieView connected to the :x11 service process")
 
-                    inputController = X11InputController(lorieView!!)
-                    addInputModeButton()
-                    lorieView?.requestFocus()
-                    startDesktopSessionIfRequested()
+                    attachDesktopInput()
                 } catch (error: Throwable) {
                     connectionFd.close()
                     logcatFd?.close()
@@ -135,34 +144,153 @@ class DesktopActivity : Activity() {
         ).also { it.connect() }
     }
 
-    private fun addInputModeButton() {
-        if (inputModeButton != null) return
+    private fun attachDesktopInput() {
+        if (inputController == null) {
+            inputController = X11InputController(lorieView!!)
+        }
+        addDesktopControls()
+        lorieView?.requestFocus()
+        startDesktopSessionIfRequested()
+    }
+
+    private fun addDesktopControls() {
+        if (controlOverlay != null) return
         val density = resources.displayMetrics.density
-        inputModeButton = Button(this).apply {
+
+        fun controlButton(label: String) = Button(this).apply {
             isAllCaps = false
             minWidth = 0
             minHeight = 0
             textSize = 12f
             setTextColor(Color.WHITE)
+            setPadding((12 * density).toInt(), 0, (12 * density).toInt(), 0)
             backgroundTintList = ColorStateList.valueOf(Color.argb(220, 28, 38, 52))
             elevation = 6 * density
-            text = inputController?.modeLabel() ?: "Trackpad"
+            text = label
+        }
+
+        val dragHandle = controlButton("⋮").apply {
+            contentDescription = "Drag desktop controls"
+            setPadding((8 * density).toInt(), 0, (8 * density).toInt(), 0)
+        }
+        val keyboardButton = controlButton("Keyboard").apply {
+            setOnClickListener { showKeyboard() }
+        }
+        inputModeButton = controlButton(inputController?.modeLabel() ?: "Trackpad").apply {
             setOnClickListener {
                 inputController?.nextMode()
                 text = inputController?.modeLabel() ?: "Trackpad"
                 Toast.makeText(this@DesktopActivity, "Input mode: $text", Toast.LENGTH_SHORT).show()
             }
-        }.also { button ->
-            val params = FrameLayout.LayoutParams(
-                (116 * density).toInt(),
-                (40 * density).toInt(),
-                Gravity.TOP or Gravity.END,
-            ).apply {
-                topMargin = (52 * density).toInt()
-                marginEnd = (8 * density).toInt()
+        }
+        val hideButton = controlButton("−").apply {
+            contentDescription = "Hide desktop controls"
+            setOnClickListener { setControlsCollapsed(true) }
+            setPadding((9 * density).toInt(), 0, (9 * density).toInt(), 0)
+        }
+
+        controlOverlay = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(dragHandle, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
+            ))
+            addView(keyboardButton, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
+            ))
+            addView(inputModeButton, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
+            ))
+            addView(hideButton, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
+            ))
+        }
+
+        collapsedControl = controlButton("☰").apply {
+            contentDescription = "Show desktop controls"
+            visibility = View.GONE
+        }
+
+        val overlayParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.START,
+        ).apply {
+            leftMargin = (8 * density).toInt()
+            topMargin = (52 * density).toInt()
+        }
+        val collapsedParams = FrameLayout.LayoutParams(
+            (48 * density).toInt(),
+            (42 * density).toInt(),
+            Gravity.TOP or Gravity.START,
+        ).apply {
+            leftMargin = overlayParams.leftMargin
+            topMargin = overlayParams.topMargin
+        }
+
+        placeholder.addView(controlOverlay, overlayParams)
+        placeholder.addView(collapsedControl, collapsedParams)
+        dragHandle.setOnTouchListener(dragListener(controlOverlay!!))
+        collapsedControl?.setOnTouchListener(dragListener(collapsedControl!!) {
+            setControlsCollapsed(false)
+        })
+        controlOverlay?.bringToFront()
+    }
+
+    private fun dragListener(target: View, onTap: (() -> Unit)? = null): View.OnTouchListener {
+        var downRawX = 0f
+        var downRawY = 0f
+        var startX = 0f
+        var startY = 0f
+        var dragged = false
+        val threshold = resources.displayMetrics.density * 6
+
+        return View.OnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    startX = target.x
+                    startY = target.y
+                    dragged = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - downRawX
+                    val dy = event.rawY - downRawY
+                    if (kotlin.math.abs(dx) > threshold || kotlin.math.abs(dy) > threshold) {
+                        dragged = true
+                    }
+                    target.x = (startX + dx).coerceIn(0f, (placeholder.width - target.width).coerceAtLeast(0).toFloat())
+                    target.y = (startY + dy).coerceIn(0f, (placeholder.height - target.height).coerceAtLeast(0).toFloat())
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!dragged) onTap?.invoke()
+                    true
+                }
+                else -> false
             }
-            placeholder.addView(button, params)
-            button.bringToFront()
+        }
+    }
+
+    private fun setControlsCollapsed(collapsed: Boolean) {
+        val from = if (collapsed) controlOverlay else collapsedControl
+        val to = if (collapsed) collapsedControl else controlOverlay
+        to?.x = from?.x ?: 0f
+        to?.y = from?.y ?: 0f
+        from?.visibility = View.GONE
+        to?.visibility = View.VISIBLE
+        to?.bringToFront()
+    }
+
+    private fun showKeyboard() {
+        val view = lorieView ?: return
+        val inputMethod = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        view.requestFocus()
+        inputMethod.restartInput(view)
+        view.post {
+            inputMethod.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
         }
     }
 
@@ -189,6 +317,8 @@ class DesktopActivity : Activity() {
     }
 
     override fun onDestroy() {
+        surfaceCallback?.let { callback -> lorieView?.holder?.removeCallback(callback) }
+        surfaceCallback = null
         inputController?.dispose()
         inputController = null
         x11ServiceClient?.disconnect()

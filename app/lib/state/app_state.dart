@@ -11,7 +11,6 @@ class AppState extends ChangeNotifier {
   String _installedDE = '';
   String _selectedDistro = 'ubuntu';
   String _selectedDE = 'xfce4';
-  String _installType = 'minimal'; // 'minimal' or 'full'
   int _setupStep = 0; // 0=welcome, 1=distro, 2=de, 3=install, 4=done
 
   // ── Download/Install Progress ──
@@ -23,9 +22,17 @@ class AppState extends ChangeNotifier {
   bool _isExtracting = false;
   bool _isInstallingDE = false;
   String? _statusMessage;
+  String _setupLog = '';
+  Map<String, bool> _optionalApps = {};
+  String? _installingOptionalApp;
+  double _optionalInstallProgress = 0.0;
+  String _optionalInstallStatus = '';
+  String _optionalInstallLog = '';
 
   // Terminal history
-  final List<String> _terminalOutput = ['DroidDesk Linux Terminal\nType commands below.\n'];
+  final List<String> _terminalOutput = [
+    'DroidDesk Linux Terminal\nType commands below.\n',
+  ];
   List<String> get terminalOutput => _terminalOutput;
 
   // ── Device Info ──
@@ -42,18 +49,23 @@ class AppState extends ChangeNotifier {
   String get installedDE => _installedDE;
   String get selectedDistro => _selectedDistro;
   String get selectedDE => _selectedDE;
-  String get installType => _installType;
   int get setupStep => _setupStep;
   double get downloadProgress => _downloadProgress;
   String get downloadStatus => _downloadStatus;
   double get extractProgress => _extractProgress;
   String get extractStatus => _extractStatus;
   String? get statusMessage => _statusMessage;
+  String get setupLog => _setupLog;
   bool get isDownloading => _isDownloading;
   bool get isExtracting => _isExtracting;
   bool get isInstallingDE => _isInstallingDE;
   Map<String, dynamic> get deviceInfo => _deviceInfo;
   String? get errorMessage => _errorMessage;
+  Map<String, bool> get optionalApps => _optionalApps;
+  String? get installingOptionalApp => _installingOptionalApp;
+  double get optionalInstallProgress => _optionalInstallProgress;
+  String get optionalInstallStatus => _optionalInstallStatus;
+  String get optionalInstallLog => _optionalInstallLog;
 
   bool get isSetupComplete => _isBootstrapped && _installedDE.isNotEmpty;
   bool get isDEInstalled => _installedDE.isNotEmpty;
@@ -116,6 +128,20 @@ class AppState extends ChangeNotifier {
       if (_terminalOutput.isEmpty) _terminalOutput.add('');
 
       final cleanedText = text.replaceAll(RegExp(r'.*\r(?!\n)'), '');
+      if (_setupStep == 3) {
+        _setupLog += cleanedText;
+        if (_setupLog.length > 20000) {
+          _setupLog = _setupLog.substring(_setupLog.length - 20000);
+        }
+      }
+      if (_installingOptionalApp != null) {
+        _optionalInstallLog += cleanedText;
+        if (_optionalInstallLog.length > 20000) {
+          _optionalInstallLog = _optionalInstallLog.substring(
+            _optionalInstallLog.length - 20000,
+          );
+        }
+      }
       final lines = cleanedText.split('\n');
 
       for (int i = 0; i < lines.length; i++) {
@@ -125,6 +151,12 @@ class AppState extends ChangeNotifier {
           _terminalOutput.add(lines[i]);
         }
       }
+      notifyListeners();
+    };
+
+    DroidDeskPlatform.onOptionalInstallProgress = (progress, status) {
+      _optionalInstallProgress = progress.clamp(0.0, 1.0);
+      _optionalInstallStatus = status;
       notifyListeners();
     };
 
@@ -140,6 +172,10 @@ class AppState extends ChangeNotifier {
       _hasRoot = status['hasRoot'] == true;
       _installedDistro = status['distro']?.toString() ?? '';
       _installedDE = status['installedDE']?.toString() ?? '';
+
+      if (_installedDE.isNotEmpty) {
+        await refreshOptionalApps();
+      }
 
       notifyListeners();
     } catch (e) {
@@ -169,26 +205,30 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  void setInstallType(String type) {
-    _installType = type;
-    notifyListeners();
-  }
-
   void setSetupStep(int step) {
     _setupStep = step;
     _errorMessage = null;
     notifyListeners();
   }
 
-  /// Main setup entry point. Chooses chroot (rooted) or native Termux path.
-  Future<void> runSetup() async {
+  Future<bool> detectRootForSetup() async {
+    _hasRoot = await DroidDeskPlatform.checkRoot();
+    notifyListeners();
+    return _hasRoot;
+  }
+
+  /// Main setup entry point. [useRoot] records confirmation from the
+  /// rooted-device dialog.
+  Future<void> runSetup({bool? useRoot}) async {
     try {
       _errorMessage = null;
+      _setupLog = '';
       _setupStep = 3;
       notifyListeners();
 
       // Detect root and choose path
-      _hasRoot = await DroidDeskPlatform.checkRoot();
+      final rootAvailable = await DroidDeskPlatform.checkRoot();
+      _hasRoot = rootAvailable && (useRoot ?? true);
       notifyListeners();
 
       if (_hasRoot) {
@@ -209,16 +249,26 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _runNativeSetup() async {
-    _statusMessage = 'Extracting native Termux bootstrap...';
+    _isExtracting = true;
+    _extractProgress = 0.0;
+    _extractStatus = 'Extracting native Termux bootstrap...';
+    _statusMessage = _extractStatus;
     notifyListeners();
     await DroidDeskPlatform.setupBootstrap();
 
-    _isExtracting = true;
-    _extractProgress = 0.0;
-    _statusMessage = 'Installing Desktop Environment via native pkg...';
+    _extractProgress = 0.08;
+    _extractStatus = 'Bootstrap environment ready';
+    _statusMessage = _extractStatus;
+    _isInstallingDE = true;
     notifyListeners();
-    await DroidDeskPlatform.installDesktopNative();
+    final installed = await DroidDeskPlatform.installDesktopNative(
+      de: _selectedDE,
+    );
+    if (!installed) {
+      throw StateError('Native Termux package installation failed');
+    }
     _isExtracting = false;
+    _isInstallingDE = false;
 
     await refreshStatus();
   }
@@ -228,19 +278,28 @@ class AppState extends ChangeNotifier {
     _isDownloading = true;
     _downloadProgress = 0.0;
     notifyListeners();
-    await DroidDeskPlatform.downloadRootfs(_selectedDistro);
+    if (!await DroidDeskPlatform.downloadRootfs(_selectedDistro)) {
+      throw StateError(
+        'Ubuntu download failed. Check your connection and retry.',
+      );
+    }
 
     _isDownloading = false;
     _isExtracting = true;
     _extractProgress = 0.0;
     _statusMessage = 'Extracting rootfs...';
     notifyListeners();
-    await DroidDeskPlatform.extractRootfs();
+    if (!await DroidDeskPlatform.extractRootfs()) {
+      throw StateError('Ubuntu filesystem extraction failed');
+    }
 
-    _statusMessage = 'Installing desktop environment (this may take a while)...';
+    _statusMessage =
+        'Installing desktop environment (this may take a while)...';
     _isInstallingDE = true;
     notifyListeners();
-    await DroidDeskPlatform.installDesktopEnvironment(_selectedDE, type: _installType);
+    if (!await DroidDeskPlatform.installDesktopEnvironment(_selectedDE)) {
+      throw StateError('Desktop Essentials package installation failed');
+    }
     _isExtracting = false;
     _isInstallingDE = false;
 
@@ -264,9 +323,16 @@ class AppState extends ChangeNotifier {
       notifyListeners();
 
       if (_hasRoot) {
-        await DroidDeskPlatform.installDesktopEnvironment(_selectedDE, type: _installType);
+        if (!await DroidDeskPlatform.installDesktopEnvironment(_selectedDE)) {
+          throw StateError('Desktop Essentials package installation failed');
+        }
       } else {
-        await DroidDeskPlatform.installDesktopNative();
+        final installed = await DroidDeskPlatform.installDesktopNative(
+          de: _selectedDE,
+        );
+        if (!installed) {
+          throw StateError('Native Termux package installation failed');
+        }
       }
 
       _isExtracting = false;
@@ -280,12 +346,53 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  // ── Optional applications ──
+
+  Future<void> refreshOptionalApps() async {
+    try {
+      _optionalApps = await DroidDeskPlatform.getOptionalApps();
+      notifyListeners();
+    } catch (_) {
+      // The desktop remains usable even if package status cannot be queried.
+    }
+  }
+
+  Future<bool> installOptionalApp(String appId) async {
+    if (_installingOptionalApp != null) return false;
+    _installingOptionalApp = appId;
+    _optionalInstallProgress = 0.0;
+    _optionalInstallStatus = 'Preparing installation...';
+    _optionalInstallLog = '';
+    notifyListeners();
+
+    try {
+      final installed = await DroidDeskPlatform.installOptionalApp(appId);
+      await refreshOptionalApps();
+      return installed;
+    } finally {
+      _installingOptionalApp = null;
+      notifyListeners();
+    }
+  }
+
   // ── Session Control ──
 
-  Future<void> startLinux({String mode = 'x11', int width = 1920, int height = 1080}) async {
+  Future<void> startLinux({
+    String mode = 'x11',
+    int width = 1920,
+    int height = 1080,
+  }) async {
     try {
       _errorMessage = null;
-      await DroidDeskPlatform.startLinux(de: _selectedDE, mode: mode, width: width, height: height);
+      final started = await DroidDeskPlatform.startLinux(
+        de: _selectedDE,
+        mode: mode,
+        width: width,
+        height: height,
+      );
+      if (!started) {
+        throw StateError('Linux runtime is not ready');
+      }
       _isRunning = true;
       notifyListeners();
     } catch (e) {

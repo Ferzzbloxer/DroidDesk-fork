@@ -22,6 +22,10 @@ class ChrootRuntime(private val context: Context) {
         // Ubuntu 24.04 ARM64 minimal rootfs
         const val ROOTFS_URL =
             "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz"
+
+        // DesktopActivity starts the chroot while MainActivity owns status and
+        // stop controls, so the process handle must be shared app-wide.
+        @Volatile private var sessionProcess: Process? = null
     }
 
     private val rootShell = RootShell(context)
@@ -31,9 +35,6 @@ class ChrootRuntime(private val context: Context) {
     private val rootfsDir: File get() = File(baseDir, "rootfs")
     private val tmpDir: File get() = File(baseDir, "tmp")
     private val x11HostDir: File get() = File(tmpDir, ".X11-unix")
-
-    @Volatile
-    private var sessionProcess: Process? = null
 
     // ── Status ──
 
@@ -51,6 +52,13 @@ class ChrootRuntime(private val context: Context) {
     fun getRootfsPath(): String = rootfsDir.absolutePath
 
     fun getRootfsSizeMB(): Long = rootfsManager.getRootfsSizeMB()
+
+    fun getOptionalAppsStatus(): Map<String, Boolean> = mapOf(
+        "firefox" to File(rootfsDir, "usr/bin/firefox").exists(),
+        "code_oss" to (File(rootfsDir, "usr/bin/code").exists() || File(rootfsDir, "usr/bin/code-oss").exists()),
+        "nodejs" to (File(rootfsDir, "usr/bin/node").exists() && File(rootfsDir, "usr/bin/npm").exists()),
+        "imagemagick" to (File(rootfsDir, "usr/bin/convert").exists() || File(rootfsDir, "usr/bin/magick").exists()),
+    )
 
     // ── Rootfs setup ──
 
@@ -87,30 +95,24 @@ class ChrootRuntime(private val context: Context) {
             File(rootfsDir, it).mkdirs()
         }
 
-        // Hardware-accelerated environment profile
+        // Portable software-rendering profile. Android vendor GPU libraries do
+        // not automatically become usable inside an Ubuntu chroot.
         File(rootfsDir, "etc/profile.d/droiddesk-ha.sh").apply {
             parentFile?.mkdirs()
             writeText(
                 """
                 #!/bin/bash
-                # DroidDesk hardware-accelerated environment
+                # DroidDesk portable graphics environment
                 export DISPLAY=:0
                 export XDG_RUNTIME_DIR=/tmp/runtime-root
                 export XDG_SESSION_TYPE=x11
                 export XDG_DATA_DIRS=/usr/share:/usr/local/share
                 export XDG_CONFIG_DIRS=/etc/xdg
 
-                # Mesa / Adreno performance
-                export MESA_NO_ERROR=1
+                # Conservative Mesa fallback that works across GPU vendors
+                export LIBGL_ALWAYS_SOFTWARE=true
                 export GALLIUM_DRIVER=llvmpipe
                 export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
-                export TU_DEBUG=noconform
-                export MESA_VK_WSI_PRESENT_MODE=immediate
-
-                # Prefer Vulkan turnip ICD if available
-                if [ -f /usr/share/vulkan/icd.d/lvp_icd.aarch64.json ]; then
-                    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json
-                fi
 
                 # Disable accessibility bus spam
                 export NO_AT_BRIDGE=1
@@ -138,6 +140,12 @@ class ChrootRuntime(private val context: Context) {
 
         // Make sure apt works without _apt sandbox user
         File(rootfsDir, "etc/apt/apt.conf.d/99-disable-sandbox").writeText("APT::Sandbox::User \"root\";\n")
+        File(rootfsDir, "etc/apt/apt.conf.d/99-droiddesk-reliability").writeText(
+            "Acquire::Retries \"3\";\n" +
+                    "Acquire::http::Timeout \"30\";\n" +
+                    "Acquire::https::Timeout \"30\";\n" +
+                    "DPkg::Lock::Timeout \"60\";\n"
+        )
 
         Log.i(TAG, "Chroot rootfs configuration complete")
     }
@@ -147,7 +155,6 @@ class ChrootRuntime(private val context: Context) {
      */
     fun installDesktopEnvironment(
         desktopEnv: String = "xfce4",
-        installType: String = "minimal",
         onProgress: (Double, String) -> Unit = { _, _ -> },
         onLog: (String) -> Unit = {}
     ) {
@@ -166,21 +173,23 @@ class ChrootRuntime(private val context: Context) {
                 ensureMounts()
 
                 onProgress(0.05, "Updating package lists...")
-                execChroot("apt-get update -y", onLog)
+                if (execChroot("apt-get update -y", onLog) != 0) {
+                    throw IllegalStateException("Package index update failed")
+                }
 
                 onProgress(0.1, "Installing core tools...")
-                execChroot(
+                if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
                             "locales ca-certificates wget curl dbus-x11",
                     onLog
-                )
+                ) != 0) throw IllegalStateException("Core package installation failed")
 
                 onProgress(0.2, "Installing Mesa GPU drivers...")
-                execChroot(
+                if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
                             "mesa-vulkan-drivers mesa-opencl-icd libgl1-mesa-dri libglx-mesa0 vulkan-tools",
                     onLog
-                )
+                ) != 0) Log.w(TAG, "Mesa packages unavailable; desktop will use available software rendering")
 
                 onProgress(0.4, "Installing desktop environment...")
                 val dePackages = when (desktopEnv) {
@@ -189,21 +198,18 @@ class ChrootRuntime(private val context: Context) {
                     "kde" -> "plasma-desktop konsole dolphin"
                     else -> "xfce4 xfce4-terminal xfce4-whiskermenu-plugin thunar mousepad"
                 }
-                execChroot(
+                if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends $dePackages",
                     onLog
-                )
+                ) != 0) throw IllegalStateException("Desktop package installation failed")
 
-                onProgress(0.8, "Installing extras...")
-                val extraPackages = if (installType == "full") {
-                    "git nano htop wget curl python3 python3-pip nodejs npm libreoffice-writer libreoffice-calc gimp vlc firefox"
-                } else {
-                    "git nano htop wget curl python3"
-                }
-                execChroot(
-                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends $extraPackages",
+                onProgress(0.8, "Installing Desktop Essentials tools...")
+                val essentialsExit = execChroot(
+                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
+                            "git nano htop wget curl python3 python3-pip openssh-client",
                     onLog
                 )
+                if (essentialsExit != 0) throw IllegalStateException("Desktop Essentials package installation failed")
 
                 onProgress(0.9, "Cleaning up...")
                 execChroot("apt-get clean", onLog)
@@ -215,6 +221,61 @@ class ChrootRuntime(private val context: Context) {
                 Log.e(TAG, "DE install failed", e)
                 onProgress(-1.0, "Installation failed: ${e.message}")
             }
+        }
+    }
+
+    fun installOptionalApp(
+        appId: String,
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {},
+    ): Boolean {
+        if (!hasRoot() || !isDesktopInstalled()) return false
+        if (getOptionalAppsStatus()[appId] == true) {
+            onProgress(1.0, "Already installed")
+            return true
+        }
+
+        return try {
+            ensureMounts()
+            onProgress(0.05, "Repairing interrupted packages...")
+            execChroot("DEBIAN_FRONTEND=noninteractive dpkg --configure -a", onLog)
+
+            val command = when (appId) {
+                "firefox" -> """
+                    set -e
+                    export DEBIAN_FRONTEND=noninteractive
+                    apt-get install -y --no-install-recommends ca-certificates wget gpg
+                    install -d -m 0755 /etc/apt/keyrings
+                    wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /etc/apt/keyrings/packages.mozilla.org.asc
+                    echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' > /etc/apt/sources.list.d/mozilla.list
+                    printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' > /etc/apt/preferences.d/mozilla
+                    apt-get update -y
+                    apt-get install -y --no-install-recommends firefox
+                """.trimIndent()
+                "code_oss" -> """
+                    set -e
+                    export DEBIAN_FRONTEND=noninteractive
+                    apt-get install -y --no-install-recommends ca-certificates wget gpg apt-transport-https
+                    install -d -m 0755 /etc/apt/keyrings
+                    wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/packages.microsoft.gpg
+                    echo 'deb [arch=arm64 signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main' > /etc/apt/sources.list.d/vscode.list
+                    apt-get update -y
+                    apt-get install -y --no-install-recommends code
+                """.trimIndent()
+                "nodejs" -> "DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y --no-install-recommends nodejs npm"
+                "imagemagick" -> "DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y --no-install-recommends imagemagick"
+                else -> return false
+            }
+
+            onProgress(0.25, "Installing optional application...")
+            val exitCode = execChroot(command, onLog)
+            if (exitCode != 0) throw IllegalStateException("Package manager exited with code $exitCode")
+            onProgress(1.0, "Installation complete")
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "Optional app installation failed: $appId", error)
+            onProgress(-1.0, "Installation failed: ${error.message}")
+            false
         }
     }
 
@@ -279,16 +340,21 @@ class ChrootRuntime(private val context: Context) {
         // Launch via ProcessBuilder through su so we get a Process handle we can monitor.
         val su = rootShell.findSuPath() ?: return
         val fullCommand = "chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(runScript)}"
-        sessionProcess = ProcessBuilder(su, "-c", fullCommand)
+        val startedSession = ProcessBuilder(su, "-c", fullCommand)
             .redirectErrorStream(true)
             .start()
+        sessionProcess = startedSession
 
         Thread {
-            val reader = sessionProcess!!.inputStream.bufferedReader()
-            val buffer = CharArray(1024)
-            var charsRead: Int
-            while (reader.read(buffer).also { charsRead = it } != -1) {
-                Log.d(TAG, "CHROOT DESKTOP: " + String(buffer, 0, charsRead))
+            try {
+                val reader = startedSession.inputStream.bufferedReader()
+                val buffer = CharArray(1024)
+                var charsRead: Int
+                while (reader.read(buffer).also { charsRead = it } != -1) {
+                    Log.d(TAG, "CHROOT DESKTOP: " + String(buffer, 0, charsRead))
+                }
+            } catch (error: java.io.IOException) {
+                Log.d(TAG, "Chroot desktop output stream closed")
             }
         }.start()
     }
@@ -412,12 +478,13 @@ class ChrootRuntime(private val context: Context) {
         }
     }
 
-    private fun execChroot(command: String, onLog: (String) -> Unit = {}) {
+    private fun execChroot(command: String, onLog: (String) -> Unit = {}): Int {
         val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; $command"
         val output = rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}") { chunk ->
             onLog(chunk)
         }
         Log.d(TAG, "chroot command exit code: $output")
+        return output
     }
 
     private fun shellQuote(input: String): String {
