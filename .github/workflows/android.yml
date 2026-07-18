@@ -1,0 +1,64 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+
+jobs:
+  build:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Pull down the repository code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Set up Java Environment (Required for Android/Gradle builds)
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      # 3. Set up the Flutter SDK environment
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 'stable' # Or specify an exact version like '3.22.0'
+          cache: true
+
+      # 4. Optional: Execute your dependency scripts if required
+      # Your root contains a 'fetch_deps.sh'. If it prepares JNI libs, run it here:
+      - name: Fetch Dependencies / Prepare Environment
+        run: |
+          chmod +x fetch_deps.sh
+          ./fetch_deps.sh
+        continue-on-error: true # Prevents failure if the script expects user input
+
+      # 5. Fetch package management dependencies
+      - name: Install Project Dependencies
+        run: |
+          cd app
+          flutter pub get
+
+      # 6. Build the actual standalone APK
+      - name: Compile Release APK
+        run: |
+          cd app
+          flutter build apk --release
+
+      # 7. Upload the compiled APK so you can download it from GitHub
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidDesk-Release-APK
+          path: app/build/app/outputs/flutter-apk/app-release.apk
