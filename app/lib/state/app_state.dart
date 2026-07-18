@@ -28,6 +28,7 @@ class AppState extends ChangeNotifier {
   double _optionalInstallProgress = 0.0;
   String _optionalInstallStatus = '';
   String _optionalInstallLog = '';
+  bool _isProotTerminal = false;
 
   // Terminal history
   final List<String> _terminalOutput = [
@@ -66,6 +67,7 @@ class AppState extends ChangeNotifier {
   double get optionalInstallProgress => _optionalInstallProgress;
   String get optionalInstallStatus => _optionalInstallStatus;
   String get optionalInstallLog => _optionalInstallLog;
+  bool get isProotTerminal => _isProotTerminal;
 
   bool get isSetupComplete => _isBootstrapped && _installedDE.isNotEmpty;
   bool get isDEInstalled => _installedDE.isNotEmpty;
@@ -429,6 +431,17 @@ class AppState extends ChangeNotifier {
     } catch (e) {
       return "Error executing command: $e";
     }
+  }
+
+  void useNativeTerminal() {
+    _isProotTerminal = false;
+    notifyListeners();
+  }
+
+  Future<void> startDebianShell() async {
+    _isProotTerminal = true;
+    clearTerminal();
+    await executeCommand('start-debian');
   }
 
   void appendTerminalOutput(String output) {

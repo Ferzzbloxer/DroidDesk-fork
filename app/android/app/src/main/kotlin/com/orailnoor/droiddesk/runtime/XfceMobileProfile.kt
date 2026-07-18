@@ -7,7 +7,7 @@ import java.io.File
 /** Installs DroidDesk's touch-friendly Ubuntu-inspired XFCE defaults once per home. */
 object XfceMobileProfile {
     private const val TAG = "XfceMobileProfile"
-    private const val PROFILE_MARKER = ".droiddesk-xfce-mobile-v1"
+    private const val PROFILE_MARKER = ".droiddesk-xfce-mobile-v5"
     private const val WALLPAPER_ASSET = "droiddesk/ubuntu-touch-wallpaper.jpg"
 
     fun install(
@@ -33,6 +33,7 @@ object XfceMobileProfile {
             File(xfconfDir, "xfce4-desktop.xml").writeText(
                 desktopConfig(xmlEscape(wallpaperPathInSession)),
             )
+            installPanelCss(homeDir)
 
             val panelDir = File(homeDir, ".config/xfce4/panel")
             writeLauncher(
@@ -89,6 +90,36 @@ object XfceMobileProfile {
         )
     }
 
+    private fun installPanelCss(homeDir: File) {
+        val cssFile = File(homeDir, ".config/gtk-3.0/gtk.css")
+        cssFile.parentFile?.mkdirs()
+        val startMarker = "/* DroidDesk mobile panel start */"
+        val endMarker = "/* DroidDesk mobile panel end */"
+        val managedBlock = """
+            $startMarker
+            .xfce4-panel #separator-4,
+            .xfce4-panel #separator-5,
+            .xfce4-panel #separator-6 {
+              min-width: 52px;
+              padding: 0;
+              margin: 0;
+            }
+            $endMarker
+        """.trimIndent()
+        val existing = if (cssFile.exists()) cssFile.readText() else ""
+        val withoutOldBlock = existing.replace(
+            Regex(
+                Regex.escape(startMarker) + ".*?" + Regex.escape(endMarker),
+                setOf(RegexOption.DOT_MATCHES_ALL),
+            ),
+            "",
+        ).trimEnd()
+        cssFile.writeText(
+            if (withoutOldBlock.isEmpty()) "$managedBlock\n"
+            else "$withoutOldBlock\n\n$managedBlock\n",
+        )
+    }
+
     private fun panelConfig(): String = """
         <?xml version="1.1" encoding="UTF-8"?>
 
@@ -113,6 +144,10 @@ object XfceMobileProfile {
                 <value type="double" value="1.000000"/>
               </property>
               <property name="plugin-ids" type="array">
+                <value type="int" value="4"/>
+                <value type="int" value="5"/>
+                <value type="int" value="6"/>
+                <value type="int" value="2"/>
                 <value type="int" value="1"/>
                 <value type="int" value="3"/>
               </property>
@@ -128,10 +163,10 @@ object XfceMobileProfile {
               <property name="icon-size" type="uint" value="36"/>
               <property name="background-style" type="uint" value="1"/>
               <property name="background-rgba" type="array">
-                <value type="double" value="0.105882"/>
-                <value type="double" value="0.082353"/>
-                <value type="double" value="0.121569"/>
-                <value type="double" value="0.940000"/>
+                <value type="double" value="0.000000"/>
+                <value type="double" value="0.000000"/>
+                <value type="double" value="0.000000"/>
+                <value type="double" value="1.000000"/>
               </property>
               <property name="plugin-ids" type="array">
                 <value type="int" value="20"/>
@@ -148,7 +183,23 @@ object XfceMobileProfile {
               <property name="expand" type="bool" value="true"/>
               <property name="style" type="uint" value="0"/>
             </property>
+            <property name="plugin-2" type="string" value="tasklist">
+              <property name="show-labels" type="bool" value="false"/>
+              <property name="grouping" type="uint" value="1"/>
+            </property>
             <property name="plugin-3" type="string" value="clock"/>
+            <property name="plugin-4" type="string" value="separator">
+              <property name="expand" type="bool" value="false"/>
+              <property name="style" type="uint" value="0"/>
+            </property>
+            <property name="plugin-5" type="string" value="separator">
+              <property name="expand" type="bool" value="false"/>
+              <property name="style" type="uint" value="0"/>
+            </property>
+            <property name="plugin-6" type="string" value="separator">
+              <property name="expand" type="bool" value="false"/>
+              <property name="style" type="uint" value="0"/>
+            </property>
             <property name="plugin-20" type="string" value="applicationsmenu">
               <property name="show-button-title" type="bool" value="false"/>
             </property>

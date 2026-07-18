@@ -1,6 +1,7 @@
 package com.orailnoor.droiddesk.runtime
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.io.BufferedReader
@@ -20,7 +21,7 @@ class LinuxRuntime(private val context: Context) {
     companion object {
         private const val TAG = "LinuxRuntime"
         private const val BOOTSTRAP_MARKER = ".bootstrap_extracted"
-        private const val SHEBANG_MARKER = ".relocated_text_paths_v2"
+        private const val SHEBANG_MARKER = ".relocated_text_paths_v3"
         private const val ELF_PATCH_MARKER = ".elf_runpaths_patched"
         private const val DE_MARKER = ".de_installed"
 
@@ -128,6 +129,106 @@ class LinuxRuntime(private val context: Context) {
         "code_oss" to (File(binDir, "code-oss").exists() || File(binDir, "code").exists()),
         "nodejs" to (File(binDir, "node").exists() && File(binDir, "npm").exists()),
         "imagemagick" to (File(binDir, "magick").exists() || File(binDir, "convert").exists()),
+        "proot_debian" to isMinimalDebianInstalled(),
+    )
+
+    private fun isMinimalDebianInstalled(): Boolean {
+        val installed = debianRootfsMarkers().any(File::exists) &&
+            File(binDir, "start-debian").exists()
+        if (installed) {
+            relocateProotExecutable()
+            writeDebianLauncher()
+            clearProotDownloadCache()
+        }
+        return installed
+    }
+
+    private fun relocateProotExecutable() {
+        val proot = File(binDir, "proot")
+        if (!proot.isFile) return
+        patchElfFile(
+            proot,
+            "/data/data/com.termux/files/usr/lib",
+            File(prefixDir, "lib").absolutePath,
+            "/data/data/com.termux/files/usr/lib/dri",
+        )
+    }
+
+    private fun writeDebianLauncher() {
+        val launcher = File(binDir, "start-debian")
+        launcher.writeText(
+            """
+            #!${File(binDir, "bash").absolutePath}
+            export DISPLAY="${'$'}{DISPLAY:-:0}"
+            export TMPDIR="${tmpDir.absolutePath}"
+            mkdir -p "${tmpDir.absolutePath}/proot"
+            exec "${File(binDir, "proot-distro").absolutePath}" login debian \
+                --bind "${tmpDir.absolutePath}:/tmp" \
+                --env PROOT_TMP_DIR="${tmpDir.absolutePath}/proot" \
+                --env PROOT_LOADER="${File(prefixDir, "libexec/proot/loader").absolutePath}" \
+                --env PROOT_LOADER_32="${File(prefixDir, "libexec/proot/loader32").absolutePath}" -- \
+                env DISPLAY="${'$'}DISPLAY" TERM="${'$'}{TERM:-xterm-256color}" bash -l
+            """.trimIndent() + "\n",
+        )
+        launcher.setExecutable(true, false)
+
+        val appsLauncher = File(binDir, "debian-apps")
+        appsLauncher.writeText(
+            """
+            #!${File(binDir, "bash").absolutePath}
+            export TMPDIR="${tmpDir.absolutePath}"
+            mkdir -p "${tmpDir.absolutePath}/proot"
+            mode="${'$'}{1:-gui}"
+            exec "${File(binDir, "proot-distro").absolutePath}" login debian \
+                --bind "${tmpDir.absolutePath}:/tmp" \
+                --env PROOT_TMP_DIR="${tmpDir.absolutePath}/proot" \
+                --env PROOT_LOADER="${File(prefixDir, "libexec/proot/loader").absolutePath}" \
+                --env PROOT_LOADER_32="${File(prefixDir, "libexec/proot/loader32").absolutePath}" -- \
+                bash -s -- "${'$'}mode" <<'DROIDDESK_DEBIAN_APPS'
+            mode="${'$'}1"
+            case "${'$'}mode" in
+                --all)
+                    dpkg-query -W -f='${'$'}{binary:Package}\t${'$'}{Version}\n' | sort
+                    ;;
+                --manual)
+                    apt-mark showmanual | sort
+                    ;;
+                gui)
+                    for desktop in \
+                        /usr/share/applications/*.desktop \
+                        /usr/local/share/applications/*.desktop
+                    do
+                        [ -f "${'$'}desktop" ] || continue
+                        no_display=${'$'}(sed -n 's/^NoDisplay=//p' "${'$'}desktop" | head -n 1)
+                        [ "${'$'}no_display" = "true" ] && continue
+                        name=${'$'}(sed -n 's/^Name=//p' "${'$'}desktop" | head -n 1)
+                        command=${'$'}(sed -n 's/^Exec=//p' "${'$'}desktop" | head -n 1)
+                        [ -n "${'$'}name" ] && [ -n "${'$'}command" ] &&
+                            printf '%-32s %s\n' "${'$'}name" "${'$'}command"
+                    done | sort -f
+                    ;;
+                *)
+                    echo "Usage: debian-apps [--manual|--all]" >&2
+                    exit 2
+                    ;;
+            esac
+            DROIDDESK_DEBIAN_APPS
+            """.trimIndent() + "\n",
+        )
+        appsLauncher.setExecutable(true, false)
+    }
+
+    private fun clearProotDownloadCache() {
+        File(prefixDir, "var/lib/proot-distro/dlcache").deleteRecursively()
+        File(prefixDir, "var/lib/proot-distro/cache").deleteRecursively()
+    }
+
+    private fun debianRootfsMarkers(): List<File> = listOf(
+        // proot-distro 5.4+
+        File(prefixDir, "var/lib/proot-distro/containers/debian/rootfs/usr/lib/os-release"),
+        File(prefixDir, "var/lib/proot-distro/containers/debian/rootfs/etc/os-release"),
+        // Legacy proot-distro releases
+        File(prefixDir, "var/lib/proot-distro/installed-rootfs/debian/etc/os-release"),
     )
 
     // ── Bootstrap ──
@@ -290,6 +391,7 @@ class LinuxRuntime(private val context: Context) {
         try {
             val dpkgBin = File(prefixDir, "bin/dpkg")
             val dpkgReal = File(prefixDir, "bin/dpkg.real")
+            val relocateShebangs = File(prefixDir, "bin/droiddesk-relocate-shebangs")
 
             // Build a mini root tree so dpkg can use Termux-style paths internally
             // while the actual files land in our private prefix.
@@ -315,6 +417,50 @@ class LinuxRuntime(private val context: Context) {
                 dpkgBin.renameTo(dpkgReal)
             }
 
+            // dpkg enumerates its compile-time configuration directory through
+            // libc APIs that are not consistently intercepted by the path hook
+            // on every Android build. Point that one embedded path at the
+            // wrapper's working directory instead.
+            patchEmbeddedCommand(
+                dpkgReal,
+                "/data/data/com.termux/files/usr/etc/dpkg",
+                "/proc/self/cwd/etc/dpkg",
+            )
+
+            // Package installations started inside the XFCE terminal bypass the
+            // Kotlin installation flow. Run this after every dpkg transaction so
+            // newly unpacked commands and maintainer scripts never retain
+            // Termux's original, inaccessible interpreter prefix.
+            relocateShebangs.writeText(
+                """
+                #!/system/bin/sh
+                old_prefix="/data/data/com.termux/files/usr"
+                new_prefix="${prefixDir.absolutePath}"
+                scan_marker="${'$'}1"
+                [ -f "${'$'}scan_marker" ] || exit 0
+                for root in \
+                    "${prefixDir.absolutePath}/bin" \
+                    "${prefixDir.absolutePath}/libexec" \
+                    "${prefixDir.absolutePath}/var/lib/dpkg/info"
+                do
+                    [ -d "${'$'}root" ] || continue
+                    "${prefixDir.absolutePath}/bin/find" "${'$'}root" \
+                        -type f -cnewer "${'$'}scan_marker" 2>/dev/null |
+                    while IFS= read -r file; do
+                        first_line=$("${prefixDir.absolutePath}/bin/head" -n 1 "${'$'}file" 2>/dev/null)
+                        case "${'$'}first_line" in
+                            "#!${'$'}old_prefix"*)
+                                "${prefixDir.absolutePath}/bin/sed" -i \
+                                    "1s|${'$'}old_prefix|${'$'}new_prefix|" "${'$'}file"
+                                ;;
+                        esac
+                    done
+                done
+                exit 0
+                """.trimIndent() + "\n",
+            )
+            relocateShebangs.setExecutable(true, false)
+
             val wrapper = """
                 #!/system/bin/sh
                 export PATH="${prefixDir.absolutePath}/bin:${'$'}PATH"
@@ -323,6 +469,7 @@ class LinuxRuntime(private val context: Context) {
                 # dpkg requires admindir to be inside root. Strip any caller-provided
                 # --root/--admindir (and their values) and prepend our own before any
                 # trailing filenames/apt separators so dpkg parses them as options.
+                caller_dir="${'$'}PWD"
                 args=""
                 while [ ${'$'}# -gt 0 ]; do
                     case "${'$'}1" in
@@ -332,12 +479,29 @@ class LinuxRuntime(private val context: Context) {
                             shift
                             ;;
                         *)
-                            args="${'$'}args ${'$'}1"
+                            arg="${'$'}1"
+                            case "${'$'}arg" in
+                                /*)
+                                    ;;
+                                *)
+                                    if [ -e "${'$'}caller_dir/${'$'}arg" ]; then
+                                        arg="${'$'}caller_dir/${'$'}arg"
+                                    fi
+                                    ;;
+                            esac
+                            args="${'$'}args ${'$'}arg"
                             ;;
                     esac
                     shift
                 done
-                exec "${dpkgReal.absolutePath}" --force-not-root --force-script-chrootless --root="${dpkgRoot.absolutePath}" --admindir="${dpkgRoot.absolutePath}/var/lib/dpkg" ${'$'}args
+                cd "${prefixDir.absolutePath}" || exit 1
+                scan_marker="${tmpDir.absolutePath}/dpkg-shebang-scan-${'$'}${'$'}"
+                : > "${'$'}scan_marker"
+                "${dpkgReal.absolutePath}" --force-not-root --force-script-chrootless --root="${dpkgRoot.absolutePath}" --admindir="${dpkgRoot.absolutePath}/var/lib/dpkg" ${'$'}args
+                status=${'$'}?
+                "${relocateShebangs.absolutePath}" "${'$'}scan_marker"
+                rm -f "${'$'}scan_marker"
+                exit ${'$'}status
             """.trimIndent()
 
             dpkgBin.writeText(wrapper)
@@ -373,6 +537,7 @@ class LinuxRuntime(private val context: Context) {
 
     private fun ensureAptDirectories() {
         listOf(
+            "etc/dpkg/dpkg.cfg.d",
             "var/cache/apt/archives/partial",
             "var/lib/apt/lists/partial",
             "var/lib/dpkg/info",
@@ -666,7 +831,12 @@ class LinuxRuntime(private val context: Context) {
         if (strTabFileOffset == null) return false
 
         val origin = "\${ORIGIN}"
-        val replacement = if (newPath.length <= oldPath.length) newPath else origin
+        val relativeLib = "\${ORIGIN}/../lib"
+        val replacement = when {
+            newPath.length <= oldPath.length -> newPath
+            file.parentFile?.absolutePath == newPath -> origin
+            else -> relativeLib
+        }
         var modified = false
 
         for (offset in runpathOffsets + rpathOffsets) {
@@ -818,6 +988,12 @@ class LinuxRuntime(private val context: Context) {
 
         env["PREFIX"] = prefixDir.absolutePath
         env["TMPDIR"] = tmpDir.absolutePath
+        // proot-distro 5.x derives all container paths from these variables.
+        // Without them it falls back to Termux's original com.termux sandbox.
+        env["TERMUX_APP__PACKAGE_NAME"] = context.packageName
+        env["TERMUX__PREFIX"] = prefixDir.absolutePath
+        env["TERMUX__HOME"] = homeDir.absolutePath
+        env["TERMUX_VERSION"] = "DroidDesk"
         env["LD_LIBRARY_PATH"] = "${prefixDir.absolutePath}/lib"
         env["PATH"] = listOf(
             "${prefixDir.absolutePath}/bin",
@@ -1066,6 +1242,42 @@ class LinuxRuntime(private val context: Context) {
         return isDpkgPackageInstalled("nodejs")
     }
 
+    /** Installs only PRoot, proot-distro and Debian's base rootfs. */
+    private fun installMinimalDebian(
+        onProgress: ((Double, String) -> Unit)? = null,
+    ): Boolean {
+        onProgress?.invoke(0.12, "Installing lightweight PRoot runtime...")
+        if (!installOptionalPackages(listOf("proot", "proot-distro"), onProgress, 0.28)) {
+            return false
+        }
+
+        patchShebangs(force = true)
+        relocateProotExecutable()
+        if (executeCommand("proot --version").startsWith("Error:")) {
+            Log.e(TAG, "Installed PRoot executable could not start")
+            return false
+        }
+
+        if (debianRootfsMarkers().none(File::exists)) {
+            // Remove an interrupted extraction so proot-distro can safely retry.
+            File(prefixDir, "var/lib/proot-distro/containers/debian").deleteRecursively()
+            File(prefixDir, "var/lib/proot-distro/installed-rootfs/debian").deleteRecursively()
+            onProgress?.invoke(0.38, "Downloading minimal Debian base system...")
+            if (executeCommand("proot-distro install debian").startsWith("Error:")) {
+                Log.e(TAG, "Minimal Debian rootfs installation failed")
+                return false
+            }
+        }
+
+        onProgress?.invoke(0.9, "Creating Debian shell shortcut...")
+        writeDebianLauncher()
+
+        // The downloaded archive is not needed after extraction.
+        clearProotDownloadCache()
+        onProgress?.invoke(1.0, "Minimal Debian compatibility is ready")
+        return isMinimalDebianInstalled()
+    }
+
     fun installDesktopEnvironmentNative(
         desktopEnv: String = "xfce4",
         onProgress: ((Double, String) -> Unit)? = null,
@@ -1210,6 +1422,7 @@ class LinuxRuntime(private val context: Context) {
                 onProgress?.invoke(0.25, "Installing ImageMagick...")
                 installOptionalPackages(listOf("imagemagick"), onProgress, 0.55)
             }
+            "proot_debian" -> installMinimalDebian(onProgress)
             else -> false
         }
 
@@ -1269,10 +1482,28 @@ class LinuxRuntime(private val context: Context) {
         try {
             dbusProcess?.destroyForcibly()
             if (dbusSocket.exists()) dbusSocket.delete()
+            val dbusConfig = File(tmpDir, "dbus-session.conf")
+            dbusConfig.writeText(
+                """
+                <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+                 "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+                <busconfig>
+                  <type>session</type>
+                  <keep_umask/>
+                  <listen>unix:path=${dbusSocket.absolutePath}</listen>
+                  <auth>EXTERNAL</auth>
+                  <servicedir>${File(prefixDir, "share/dbus-1/services").absolutePath}</servicedir>
+                  <policy context="default">
+                    <allow send_destination="*" eavesdrop="true"/>
+                    <allow eavesdrop="true"/>
+                    <allow own="*"/>
+                  </policy>
+                </busconfig>
+                """.trimIndent() + "\n",
+            )
             val dbusCmd = listOf(
                 File(prefixDir, "bin/dbus-daemon").absolutePath,
-                "--session",
-                "--address=unix:path=${dbusSocket.absolutePath}",
+                "--config-file=${dbusConfig.absolutePath}",
                 "--nofork",
                 "--nopidfile"
             )
@@ -1329,8 +1560,28 @@ class LinuxRuntime(private val context: Context) {
             # Use the session bus DroidDesk already started
             export DBUS_SESSION_BUS_ADDRESS="unix:path=${dbusSocket.absolutePath}"
 
-            # Native Termux audio; no VNC server or secondary display is involved.
-            pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
+            # Native Android audio. AAudio is reliable on modern Android while
+            # OpenSL ES remains the compatibility fallback for older devices.
+            pulseaudio -k >/dev/null 2>&1 || true
+            if [ "${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) "1" else "0"}" = "1" ]; then
+                pulseaudio --start --exit-idle-time=-1 \
+                    --load=module-aaudio-sink >/dev/null 2>&1 || true
+                audio_ready=0
+                for attempt in 1 2 3 4 5 6 7 8 9 10; do
+                    if pactl list short sinks 2>/dev/null | grep -q AAudio_sink; then
+                        audio_ready=1
+                        break
+                    fi
+                    sleep 0.1
+                done
+                if [ "${'$'}audio_ready" != "1" ]; then
+                    pulseaudio -k >/dev/null 2>&1 || true
+                    pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
+                fi
+            else
+                pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
+            fi
+            echo "DIAG: PulseAudio sinks: ${'$'}(pactl list short sinks 2>/dev/null | cut -f2 | tr '\n' ' ')"
 
             echo "DIAG: Launching $desktopCommand natively on DISPLAY=:0 ..."
             exec $desktopCommand

@@ -202,3 +202,21 @@ Add this line:
 ## Credits
 
 Created by [orailnoor](https://youtube.com/@orailnoor)
+
+## License and third-party software
+
+DroidDesk is independent software licensed under
+[GNU GPL version 3 only](LICENSE). It is not affiliated with or endorsed by
+Termux, Termux:X11, TUR, Canonical, Ubuntu, or other upstream projects.
+
+The Android application incorporates GPL-licensed Termux:X11 components and
+bundles other third-party software under their respective licenses. See:
+
+- [Notices and attribution](NOTICE.md)
+- [Third-party software inventory](THIRD_PARTY_NOTICES.md)
+- [Release compliance status](COMPLIANCE.md)
+
+The current compliance checklist includes unresolved source provenance,
+reproducible-build, custom-prefix bootstrap, and wallpaper-license work. Do not
+describe a binary release as fully compliant until the blocking checklist items
+are complete.

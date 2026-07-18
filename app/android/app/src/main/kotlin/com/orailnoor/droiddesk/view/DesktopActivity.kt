@@ -57,12 +57,14 @@ class DesktopActivity : Activity() {
         desktopEnv = intent.getStringExtra("de") ?: "xfce4"
 
         requestWindowFeature(Window.FEATURE_NO_TITLE)
-        enableImmersiveMode()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         placeholder = FrameLayout(this)
         placeholder.setBackgroundColor(Color.BLACK)
         setContentView(placeholder)
+        // Some Android/LineageOS builds throw from PhoneWindow.getInsetsController
+        // until a decor view has been created by setContentView().
+        enableImmersiveMode()
 
         Log.i(TAG, "DesktopActivity created mode=$sessionMode startSession=$shouldStartSession")
     }
@@ -93,7 +95,7 @@ class DesktopActivity : Activity() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(false)
-            window.insetsController?.apply {
+            window.decorView.windowInsetsController?.apply {
                 hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
                 systemBarsBehavior =
                     WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -245,7 +247,9 @@ class DesktopActivity : Activity() {
 
         collapsedControl = controlButton("☰").apply {
             contentDescription = "Show desktop controls"
-            visibility = View.GONE
+            // Keep this measured so switching from a dragged full overlay can
+            // copy absolute coordinates without placing the restore handle off-screen.
+            visibility = View.INVISIBLE
         }
 
         val overlayParams = FrameLayout.LayoutParams(
@@ -316,7 +320,7 @@ class DesktopActivity : Activity() {
         val to = if (collapsed) collapsedControl else controlOverlay
         to?.x = from?.x ?: 0f
         to?.y = from?.y ?: 0f
-        from?.visibility = View.GONE
+        from?.visibility = View.INVISIBLE
         to?.visibility = View.VISIBLE
         to?.bringToFront()
     }

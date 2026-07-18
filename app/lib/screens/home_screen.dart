@@ -181,8 +181,24 @@ class HomeScreen extends StatelessWidget {
                         subtitle:
                             'Open a Linux shell in the ${state.hasRoot ? 'Ubuntu chroot' : 'native Termux'} environment',
                         color: DroidTheme.secondary,
-                        onTap: () => _showTerminal(context, state),
+                        onTap: () {
+                          state.useNativeTerminal();
+                          _showTerminal(context, state);
+                        },
                       ),
+
+                      if (!state.hasRoot &&
+                          state.optionalApps['proot_debian'] == true) ...[
+                        const SizedBox(height: 10),
+                        _ActionCard(
+                          icon: Icons.inventory_2_rounded,
+                          title: 'Debian shell',
+                          subtitle:
+                              'Open the optional minimal PRoot compatibility environment',
+                          color: const Color(0xFFD70A53),
+                          onTap: () => _showDebianTerminal(context, state),
+                        ),
+                      ],
 
                       const SizedBox(height: 10),
 
@@ -190,7 +206,7 @@ class HomeScreen extends StatelessWidget {
                         icon: Icons.apps_rounded,
                         title: 'Add applications',
                         subtitle:
-                            'Install Firefox, Code OSS, Node.js, and other optional tools',
+                            'Install applications or optional Debian compatibility',
                         color: DroidTheme.primaryLight,
                         onTap: () {
                           Navigator.of(context).push(
@@ -437,6 +453,13 @@ class HomeScreen extends StatelessWidget {
       builder: (context) => _TerminalSheet(state: state),
     );
   }
+
+  void _showDebianTerminal(BuildContext context, AppState state) {
+    _showTerminal(context, state);
+    Future<void>.delayed(const Duration(milliseconds: 150), () {
+      state.startDebianShell();
+    });
+  }
 }
 
 /// Simple terminal bottom sheet with command execution.
@@ -550,7 +573,9 @@ class _TerminalSheetState extends State<_TerminalSheet> {
                     ),
                     const SizedBox(width: 8),
                     Text(
-                      widget.state.hasRoot
+                      widget.state.isProotTerminal
+                          ? 'compat · Debian PRoot'
+                          : widget.state.hasRoot
                           ? 'chroot · ${_distroLabel(widget.state.installedDistro)}'
                           : 'native · Termux/TUR',
                       style: DroidTheme.monoSm,

@@ -42,6 +42,14 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
     ),
   ];
 
+  static const _proot = _OptionalApp(
+    id: 'proot_debian',
+    name: 'Debian (PRoot)',
+    description: 'Minimal PRoot base system. No applications are included.',
+    icon: Icons.inventory_2_rounded,
+    color: Color(0xFFD70A53),
+  );
+
   @override
   void initState() {
     super.initState();
@@ -69,6 +77,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
+    final apps = state.hasRoot ? _apps : [..._apps, _proot];
     return Scaffold(
       appBar: AppBar(title: const Text('Add applications')),
       body: Container(
@@ -85,7 +94,7 @@ class _AppCatalogScreenState extends State<AppCatalogScreen> {
               style: DroidTheme.bodyMd,
             ),
             const SizedBox(height: 20),
-            for (final app in _apps) ...[
+            for (final app in apps) ...[
               _buildAppCard(state, app),
               const SizedBox(height: 10),
             ],
