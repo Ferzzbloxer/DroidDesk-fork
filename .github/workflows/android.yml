@@ -33,7 +33,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: 'stable' # Or specify an exact version like '3.22.0'
+          channel: 'stable'
           cache: true
 
       # 4. Optional: Execute your dependency scripts if required
