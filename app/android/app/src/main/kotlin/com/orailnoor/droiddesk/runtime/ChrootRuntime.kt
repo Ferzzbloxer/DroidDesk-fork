@@ -173,7 +173,8 @@ class ChrootRuntime(private val context: Context) {
                 ensureMounts()
 
                 onProgress(0.05, "Updating package lists...")
-                if (execChroot("apt-get update -y", onLog) != 0) {
+                // ADD "-o APT::Sandbox::User=root" to the command
+                if (execChroot("apt-get -o APT::Sandbox::User=root update -y", onLog) != 0) {
                     throw IllegalStateException("Package index update failed")
                 }
 
