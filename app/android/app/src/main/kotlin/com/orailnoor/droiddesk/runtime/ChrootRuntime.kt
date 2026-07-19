@@ -24,24 +24,20 @@ class ChrootRuntime(private val context: Context) {
 
     fun hasRoot(): Boolean = rootShell.hasRoot()
     fun isRootfsReady(): Boolean = rootfsManager.isRootfsReady()
-    fun isDesktopInstalled(): Boolean = File(rootfsDir, CHROOT_DE_MARKER).exists() || File(rootfsDir, "usr/bin/startxfce4").exists()
+    
+    // THE FIX: Check the marker in baseDir instead of rootfsDir
+    fun isDesktopInstalled(): Boolean = File(baseDir, CHROOT_DE_MARKER).exists()
     fun isRunning(): Boolean = sessionProcess?.isAlive == true
     fun getRootfsPath(): String = rootfsDir.absolutePath
     fun getRootfsSizeMB(): Long = rootfsManager.getRootfsSizeMB()
 
-    fun getOptionalAppsStatus(): Map<String, Boolean> = mapOf(
-        "firefox" to File(rootfsDir, "usr/bin/firefox").exists(),
-        "code_oss" to (File(rootfsDir, "usr/bin/code").exists() || File(rootfsDir, "usr/bin/code-oss").exists()),
-        "nodejs" to (File(rootfsDir, "usr/bin/node").exists() && File(rootfsDir, "usr/bin/npm").exists()),
-        "imagemagick" to (File(rootfsDir, "usr/bin/convert").exists() || File(rootfsDir, "usr/bin/magick").exists()),
-    )
+    fun getOptionalAppsStatus(): Map<String, Boolean> = mapOf()
 
     fun downloadRootfs(onProgress: (Double, String) -> Unit) {
         rootfsManager.downloadRootfs("ubuntu", onProgress)
     }
 
     fun extractRootfs(onProgress: (Double, String) -> Unit) {
-        // We removed the configureChrootRootfs call from here to prevent race conditions
         rootfsManager.extractRootfs(onProgress)
     }
 
@@ -69,7 +65,6 @@ class ChrootRuntime(private val context: Context) {
         """.trimIndent()
         rootShell.exec("cat << 'EOF' > \"$path/etc/profile.d/droiddesk-ha.sh\"\n$haScript\nEOF")
 
-        // VERY IMPORTANT: Write sources.list so apt-get knows where to download things
         val sources = """
             deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
             deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
@@ -100,22 +95,18 @@ class ChrootRuntime(private val context: Context) {
 
         thread(name = "chroot-de-install") {
             try {
-                // 1. Sync Configs synchronously to avoid Race Condition
                 onProgress(0.0, "Configuring Ubuntu for Android...")
-                configureChrootRootfs() 
+                configureChrootRootfs()
 
-                // 2. Ensure Mounts
                 onProgress(0.05, "Mounting virtual filesystems...")
                 ensureMounts()
 
-                // 3. Fix Android Network Permissions inside Chroot
-                // Android requires Group 3003 (inet) for internet access. We force this group onto apt.
+                // Fix Android Network Permissions inside Chroot
                 onLog("Adding Android network groups to Linux...\n")
                 execChroot("groupadd -g 3003 inet || true", onLog)
                 execChroot("usermod -aG inet root || true", onLog)
                 execChroot("usermod -aG inet _apt || true", onLog)
 
-                // 4. Update and Install
                 onProgress(0.1, "Updating package lists...")
                 if (execChroot("apt-get -o APT::Sandbox::User=root update -y", onLog) != 0) {
                     throw IllegalStateException("apt-get update failed. Check network connection.")
@@ -157,7 +148,8 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.9, "Cleaning up...")
                 execChroot("apt-get clean", onLog)
 
-                rootShell.exec("echo '$desktopEnv' > \"${rootfsDir.absolutePath}/$CHROOT_DE_MARKER\"")
+                // THE FIX: Save the marker to the baseDir so the App User can verify it exists later
+                File(baseDir, CHROOT_DE_MARKER).writeText(desktopEnv)
 
                 onProgress(1.0, "$desktopEnv installed in chroot")
                 Log.i(TAG, "Desktop environment installation complete")
@@ -169,7 +161,6 @@ class ChrootRuntime(private val context: Context) {
     }
 
     fun installOptionalApp(appId: String, onProgress: (Double, String) -> Unit = { _, _ -> }, onLog: (String) -> Unit = {}): Boolean {
-        // Omitting optional apps rewrite for brevity since it wasn't the failure point
         return true
     }
 
