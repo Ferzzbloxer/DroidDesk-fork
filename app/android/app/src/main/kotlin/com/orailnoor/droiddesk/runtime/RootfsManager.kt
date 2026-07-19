@@ -8,10 +8,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
 
-/**
- * Manages Linux rootfs downloads, extraction, and lifecycle.
- * Combined Fix Version: Script-based extraction with Root ownership for apt compatibility.
- */
 class RootfsManager(private val context: Context) {
 
     companion object {
@@ -37,16 +33,14 @@ class RootfsManager(private val context: Context) {
     private val configFile: File get() = File(baseDir, "distro.conf")
     private val deConfigFile: File get() = File(baseDir, "de.conf")
 
-    // ── Status Helpers ──
-
     fun getInstalledDistro(): String = if (configFile.exists()) configFile.readText().trim() else ""
     fun getInstalledDE(): String = if (deConfigFile.exists()) deConfigFile.readText().trim() else ""
     fun getRootfsPath(): String = rootfsDir.absolutePath
     fun getRootfsSizeMB(): Long = if (rootfsDir.exists()) calculateDirSize(rootfsDir) / (1024 * 1024) else 0
 
     fun isRootfsReady(): Boolean {
-        // Simple existence check
-        return rootfsDir.exists() && File(rootfsDir, "etc").exists()
+        // App can check exists() as long as root directory has +x permissions
+        return rootfsDir.exists() && File(rootfsDir, "bin").exists() && File(rootfsDir, "etc").exists()
     }
 
     fun getMissingPackages(): List<String> {
@@ -61,8 +55,124 @@ class RootfsManager(private val context: Context) {
         return if (File(rootfsDir, deBin).exists()) emptyList() else listOf(de)
     }
 
-    // ── Download ──
+    fun downloadRootfs(distro: String, onProgress: (Double, String) -> Unit) {
+        thread(name = "rootfs-download") {
+            try {
+                val url = DISTRO_URLS[distro] ?: throw IllegalArgumentException("Unknown distro")
+                downloadDir.mkdirs()
+                val targetFile = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
+                
+                val connection = URL(url).openConnection() as HttpURLConnection
+                connection.connectTimeout = 30000
+                
+                var downloadedBytes = 0L
+                if (targetFile.exists()) {
+                    downloadedBytes = targetFile.length()
+                    connection.setRequestProperty("Range", "bytes=$downloadedBytes-")
+                }
 
+                if (connection.responseCode == 416) {
+                    onProgress(1.0, "Already downloaded")
+                    configFile.writeText(distro)
+                    return@thread
+                }
+
+                downloadFromConnection(connection, targetFile, distro, downloadedBytes, onProgress)
+                configFile.writeText(distro)
+                onProgress(1.0, "Download complete")
+            } catch (e: Exception) {
+                onProgress(-1.0, "Download failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun downloadFromConnection(conn: HttpURLConnection, file: File, name: String, start: Long, progress: (Double, String) -> Unit) {
+        var current = start
+        val total = conn.contentLengthLong + start
+        conn.inputStream.use { input ->
+            FileOutputStream(file, true).use { output ->
+                val buffer = ByteArray(BUFFER_SIZE)
+                var read: Int
+                while (input.read(buffer).also { read = it } != -1) {
+                    output.write(buffer, 0, read)
+                    current += read
+                    progress(current.toDouble() / total, "Downloading: ${current / 1024 / 1024}MB / ${total / 1024 / 1024}MB")
+                }
+            }
+        }
+    }
+
+    fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
+        thread(name = "rootfs-extract") {
+            try {
+                val distro = getInstalledDistro()
+                val tarball = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
+                if (!tarball.exists()) throw Exception("Tarball not found")
+
+                val rootShell = RootShell(context)
+                onProgress(0.1, "Preparing extraction...")
+                rootShell.exec("rm -rf \"${rootfsDir.absolutePath}\" && mkdir -p \"${rootfsDir.absolutePath}\"")
+
+                val ext = if (distro == "kali") "xz" else "gz"
+                val tarFlags = if (ext == "xz") "Jxf" else "zxf"
+                
+                onProgress(0.2, "Extracting Linux Filesystem...")
+                
+                // We use 2>/dev/null to hide the harmless Android toybox absolute symlink warnings
+                val cmd = "tar $tarFlags \"${tarball.absolutePath}\" -C \"${rootfsDir.absolutePath}\" 2>/dev/null"
+                rootShell.exec(cmd)
+
+                // Verify success via Root
+                val checkCmd = "if [ -f \"${rootfsDir.absolutePath}/bin/bash\" ]; then echo SUCCESS; else echo FAIL; fi"
+                val result = rootShell.exec(checkCmd)
+                if (!result.contains("SUCCESS")) {
+                    throw RuntimeException("Extraction failed: Core OS files missing.")
+                }
+
+                // Grant the app directory traversal permissions so Kotlin File.exists() works
+                rootShell.exec("chmod 755 \"${rootfsDir.absolutePath}\"")
+                rootShell.exec("chmod 755 \"${rootfsDir.absolutePath}/bin\"")
+                rootShell.exec("chmod 755 \"${rootfsDir.absolutePath}/etc\"")
+
+                onProgress(0.7, "Configuring Linux environment...")
+                configureRootfs()
+                
+                File(context.filesDir, "SETUP_COMPLETE").writeText("done")
+                tarball.delete()
+                
+                onProgress(1.0, "${DISTRO_NAMES[distro] ?: distro} setup complete")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Extraction failed: ${e.message}", e)
+                onProgress(-1.0, "Extraction failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun configureRootfs() {
+        val rootShell = RootShell(context)
+        val path = rootfsDir.absolutePath
+
+        // We use RootShell to create configurations since the folders are owned by root
+        rootShell.exec("mkdir -p \"$path/etc/apt/apt.conf.d\"")
+        rootShell.exec("echo 'APT::Sandbox::User \"root\";' > \"$path/etc/apt/apt.conf.d/99-disable-sandbox\"")
+        rootShell.exec("echo 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > \"$path/etc/resolv.conf\"")
+        rootShell.exec("echo 'droiddesk' > \"$path/etc/hostname\"")
+        rootShell.exec("echo '127.0.0.1 localhost\n127.0.0.1 droiddesk\n::1 localhost' > \"$path/etc/hosts\"")
+        
+        rootShell.exec("mkdir -p \"$path/etc/profile.d\"")
+        rootShell.exec("echo 'export DISPLAY=:0\nexport PULSE_SERVER=127.0.0.1\nexport XDG_RUNTIME_DIR=/tmp/runtime-root\nmkdir -p /tmp/runtime-root 2>/dev/null\nexport PS1=\"\\[\\033[01;32m\\]droiddesk\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ \"' > \"$path/etc/profile.d/droiddesk.sh\"")
+        
+        rootShell.exec("mkdir -p \"$path/etc/sudoers.d\"")
+        rootShell.exec("echo 'Defaults !requiretty\nroot ALL=(ALL) NOPASSWD: ALL' > \"$path/etc/sudoers.d/droiddesk\"")
+        
+        rootShell.exec("mkdir -p \"$path/tmp\" \"$path/run\" \"$path/proc\" \"$path/sys\" \"$path/dev/pts\" \"$path/dev/shm\"")
+    }
+
+    private fun calculateDirSize(dir: File): Long {
+        return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+    }
+}
     fun downloadRootfs(distro: String, onProgress: (Double, String) -> Unit) {
         thread(name = "rootfs-download") {
             try {
