@@ -4,16 +4,13 @@ import android.content.Context
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.zip.GZIPInputStream
 import kotlin.concurrent.thread
 
 /**
  * Manages Linux rootfs downloads, extraction, and lifecycle.
- *
- * Modified Version: Includes Script-based Root Extraction with persistent logging.
+ * Combined Fix Version: Script-based extraction with Root ownership for apt compatibility.
  */
 class RootfsManager(private val context: Context) {
 
@@ -48,7 +45,8 @@ class RootfsManager(private val context: Context) {
     fun getRootfsSizeMB(): Long = if (rootfsDir.exists()) calculateDirSize(rootfsDir) / (1024 * 1024) else 0
 
     fun isRootfsReady(): Boolean {
-        return rootfsDir.exists() && File(rootfsDir, "bin").exists() && File(rootfsDir, "etc").exists()
+        // Simple existence check
+        return rootfsDir.exists() && File(rootfsDir, "etc").exists()
     }
 
     fun getMissingPackages(): List<String> {
@@ -63,7 +61,7 @@ class RootfsManager(private val context: Context) {
         return if (File(rootfsDir, deBin).exists()) emptyList() else listOf(de)
     }
 
-    // ── Download Logic ──
+    // ── Download ──
 
     fun downloadRootfs(distro: String, onProgress: (Double, String) -> Unit) {
         thread(name = "rootfs-download") {
@@ -112,7 +110,7 @@ class RootfsManager(private val context: Context) {
         }
     }
 
-    // ── EXTRACTION LOGIC (The Fixed Part) ──
+    // ── EXTRACTION (The Corrected Fixed Version) ──
 
     fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
         thread(name = "rootfs-extract") {
@@ -127,10 +125,7 @@ class RootfsManager(private val context: Context) {
                 val logFile = File(context.filesDir, "setup_debug.log")
                 if (logFile.exists()) logFile.delete()
 
-                onProgress(0.05, "Preparing root environment...")
-
-                // We get the App's UID to give the folder back to the app at the end
-                val appUid = context.applicationInfo.uid
+                onProgress(0.05, "Initializing Root Helper...")
 
                 val scriptContent = """
                     #!/system/bin/sh
@@ -138,16 +133,16 @@ class RootfsManager(private val context: Context) {
                     SRC="${tarball.absolutePath}"
                     LOG="${logFile.absolutePath}"
                     
+                    # Redirect everything to persistent log
                     exec > "${'$'}LOG" 2>&1
-                    
                     echo "START_TIME: $(date)"
                     
-                    # 1. Clean and Create
+                    # 1. Prepare target
                     rm -rf "${'$'}DEST"
                     mkdir -p "${'$'}DEST"
                     cd "${'$'}DEST" || exit 1
                     
-                    # 2. Extract
+                    # 2. Extract using absolute path bypass (-P)
                     echo "Unpacking Linux Filesystem..."
                     if echo "${'$'}SRC" | grep -q ".xz"; then
                         xz -dc "${'$'}SRC" | tar -x -p -P --no-same-owner
@@ -155,81 +150,18 @@ class RootfsManager(private val context: Context) {
                         zcat "${'$'}SRC" | tar -x -p -P --no-same-owner
                     fi
                     
-                    # 3. THE FIX: Ownership Handshake
-                    # We give the folder back to the app user so Kotlin can 'see' it
-                    chown -R $appUid:$appUid "${'$'}DEST"
-                    chmod -R 755 "${'$'}DEST"
-                    
-                    EXIT_CODE=${'$'}?
-                    echo "PROCESS_FINISHED_CODE: ${'$'}EXIT_CODE"
-                    
-                    # 4. Root-side verification
-                    if [ -f "${'$'}DEST/bin/bash" ] || [ -f "${'$'}DEST/bin/sh" ]; then
-                        echo "VERIFICATION_RESULT: SUCCESS"
-                    else
-                        echo "VERIFICATION_RESULT: FAILURE"
-                    fi
-                """.trimIndent()
-                
-                scriptFile.writeText(scriptContent)
-                rootShell.exec("chmod 777 \"${scriptFile.absolutePath}\"")
-
-                onProgress(0.1, "Extracting...")
-
-                // Run the script
-                rootShell.exec("sh \"${scriptFile.absolutePath}\"")
-
-                // Monitor the log file
-                var finished = false
-                var rootSaysSuccess = false
-                
-                while (!finished) {
-                    if (logFile.exists()) {
-                        val currentLog = logFile.readText()
-                        
-fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
-        thread(name = "rootfs-extract") {
-            try {
-                val distro = getInstalledDistro()
-                val tarball = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
-                val rootShell = RootShell(context)
-                
-                if (!tarball.exists()) throw Exception("Tarball not found")
-
-                val scriptFile = File(context.filesDir, "extract_helper.sh")
-                val logFile = File(context.filesDir, "setup_debug.log")
-                if (logFile.exists()) logFile.delete()
-
-                onProgress(0.05, "Preparing root environment...")
-
-                val scriptContent = """
-                    #!/system/bin/sh
-                    DEST="${rootfsDir.absolutePath}"
-                    SRC="${tarball.absolutePath}"
-                    LOG="${logFile.absolutePath}"
-                    
-                    exec > "${'$'}LOG" 2>&1
-                    echo "START_TIME: $(date)"
-                    
-                    rm -rf "${'$'}DEST"
-                    mkdir -p "${'$'}DEST"
-                    cd "${'$'}DEST" || exit 1
-                    
-                    echo "Unpacking Linux Filesystem..."
-                    if echo "${'$'}SRC" | grep -q ".xz"; then
-                        xz -dc "${'$'}SRC" | tar -x -p -P --no-same-owner
-                    else
-                        zcat "${'$'}SRC" | tar -x -p -P --no-same-owner
-                    fi
-                    
-                    # THE FIX: Keep it owned by root (0:0) for Linux compatibility
-                    # But make directories searchable so the app can verify
+                    # 3. Fix Ownership for Linux compatibility (UID 0 = root)
+                    # This ensures 'apt' doesn't complain about permissions
                     chown -R 0:0 "${'$'}DEST"
+                    
+                    # 4. Fix Permissions for App Verification
+                    # We make directories searchable so the Android App can 'exists()' them
                     find "${'$'}DEST" -type d -exec chmod 755 {} +
                     
                     EXIT_CODE=${'$'}?
                     echo "PROCESS_FINISHED_CODE: ${'$'}EXIT_CODE"
                     
+                    # 5. Internal Verification
                     if [ -f "${'$'}DEST/bin/bash" ] || [ -f "${'$'}DEST/bin/sh" ]; then
                         echo "VERIFICATION_RESULT: SUCCESS"
                     else
@@ -239,14 +171,19 @@ fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
                 
                 scriptFile.writeText(scriptContent)
                 rootShell.exec("chmod 777 \"${scriptFile.absolutePath}\"")
-                onProgress(0.1, "Extracting rootfs...")
+
+                onProgress(0.1, "Extracting (Root Mode)...")
                 rootShell.exec("sh \"${scriptFile.absolutePath}\"")
 
+                // Monitoring log for completion string
                 var finished = false
                 var rootSaysSuccess = false
                 while (!finished) {
                     if (logFile.exists()) {
                         val currentLog = logFile.readText()
+                        val uiLines = currentLog.split("\n")
+                        if (uiLines.isNotEmpty()) onProgress(0.1, uiLines.last())
+
                         if (currentLog.contains("PROCESS_FINISHED_CODE")) {
                             finished = true
                             if (currentLog.contains("VERIFICATION_RESULT: SUCCESS")) rootSaysSuccess = true
@@ -255,13 +192,14 @@ fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
                     Thread.sleep(1000)
                 }
 
-                if (!rootSaysSuccess) throw Exception("Extraction verification failed.")
+                if (!rootSaysSuccess) throw Exception("Root verification failed. OS did not unpack.")
 
-                onProgress(0.7, "Configuring Linux...")
+                onProgress(0.7, "Configuring Linux Base...")
                 configureRootfs()
+                
                 File(context.filesDir, "SETUP_COMPLETE").writeText("done")
                 tarball.delete() 
-                onProgress(1.0, "Extraction complete!")
+                onProgress(1.0, "Rootfs extracted successfully!")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Rootfs extraction failed", e)
@@ -270,21 +208,22 @@ fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
         }
     }
 
-    // ── Configuration Logic ──
+    // ── Configuration ──
 
     private fun configureRootfs() {
-        // DNS
+        // 1. DNS setup
         File(rootfsDir, "etc/resolv.conf").apply {
             parentFile?.mkdirs()
             writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
         }
 
-        // Fix Apt for Android (Network Fix)
+        // 2. Apt Sandbox Fix (CRITICAL for Chroot)
+        // This stops apt from trying to switch to the '_apt' user which fails on Android
         val aptConf = File(rootfsDir, "etc/apt/apt.conf.d/99-android")
         aptConf.parentFile?.mkdirs()
         aptConf.writeText("APT::Sandbox::User \"root\";\n")
 
-        // DroidDesk Environment Profile
+        // 3. Environment Variables
         File(rootfsDir, "etc/profile.d/droiddesk.sh").writeText("""
             export DISPLAY=:0
             export PULSE_SERVER=127.0.0.1
@@ -293,16 +232,17 @@ fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
             export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
         """.trimIndent())
 
-        // Create virtual nodes
+        // 4. Create mandatory virtual filesystem mountpoints
         listOf("tmp", "run", "proc", "sys", "dev", "dev/pts", "dev/shm").forEach {
             File(rootfsDir, it).mkdirs()
         }
     }
 
     fun installDesktopEnvironment(de: String, runtime: LinuxRuntime, onProgress: (Double, String) -> Unit, onLog: (String) -> Unit) {
+        // This is a bridge function for the standard setup wizard
         thread(name = "de-install") {
             try {
-                onProgress(0.1, "Updating repositories...")
+                onProgress(0.1, "Refreshing Ubuntu Repositories...")
                 runtime.executeCommand("apt-get update", onLog)
                 
                 val pkgs = when (de) {
@@ -312,11 +252,12 @@ fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
                     else -> "xfce4 dbus-x11"
                 }
 
-                onProgress(0.3, "Installing $de Desktop...")
-                runtime.executeCommand("DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs", onLog)
+                onProgress(0.3, "Downloading & Installing $de...")
+                // We force '-o APT::Sandbox::User=root' for reliability
+                runtime.executeCommand("DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root install -y $pkgs", onLog)
                 
                 deConfigFile.writeText(de)
-                onProgress(1.0, "Desktop installed!")
+                onProgress(1.0, "Desktop installation complete!")
             } catch (e: Exception) {
                 onProgress(-1.0, "DE Install failed: ${e.message}")
             }
