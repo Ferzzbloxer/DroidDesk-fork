@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.orailnoor.droiddesk"
+    namespace = "com.orailnoor.droiddesk.dev"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
