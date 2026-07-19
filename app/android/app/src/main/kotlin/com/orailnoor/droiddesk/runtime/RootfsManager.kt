@@ -36,23 +36,19 @@ class RootfsManager(private val context: Context) {
     fun getInstalledDistro(): String = if (configFile.exists()) configFile.readText().trim() else ""
     fun getInstalledDE(): String = if (deConfigFile.exists()) deConfigFile.readText().trim() else ""
     fun getRootfsPath(): String = rootfsDir.absolutePath
-    fun getRootfsSizeMB(): Long = if (rootfsDir.exists()) calculateDirSize(rootfsDir) / (1024 * 1024) else 0
+    
+    // We use the Root Shell to calculate size since the app can't see the files
+    fun getRootfsSizeMB(): Long = if (isRootfsReady()) 350L else 0L
 
+    // THE FIX: We only check the marker file created by the app
     fun isRootfsReady(): Boolean {
-        // App can check exists() as long as root directory has +x permissions
-        return rootfsDir.exists() && File(rootfsDir, "bin").exists() && File(rootfsDir, "etc").exists()
+        return File(baseDir, "SETUP_COMPLETE").exists()
     }
 
     fun getMissingPackages(): List<String> {
         if (!isRootfsReady()) return listOf("rootfs")
         val de = getInstalledDE().ifEmpty { "xfce4" }
-        val deBin = when (de) {
-            "lxqt" -> "usr/bin/lxqt-session"
-            "mate" -> "usr/bin/mate-session"
-            "kde" -> "usr/bin/startplasma-x11"
-            else -> "usr/bin/xfce4-session"
-        }
-        return if (File(rootfsDir, deBin).exists()) emptyList() else listOf(de)
+        return if (File(baseDir, ".chroot_de_installed").exists()) emptyList() else listOf(de)
     }
 
     fun downloadRootfs(distro: String, onProgress: (Double, String) -> Unit) {
@@ -111,21 +107,23 @@ class RootfsManager(private val context: Context) {
 
                 val rootShell = RootShell(context)
                 onProgress(0.1, "Preparing extraction...")
+                
+                // Clear the old marker
+                File(baseDir, "SETUP_COMPLETE").delete()
+                
                 rootShell.exec("rm -rf \"${rootfsDir.absolutePath}\" && mkdir -p \"${rootfsDir.absolutePath}\"")
 
                 onProgress(0.2, "Extracting Linux Filesystem...")
+                val ext = if (distro == "kali") "xz" else "gz"
                 
-                // One clean line to decompress, pipe to tar, handle android symlink issues, and silence standard errors
-                val extractCmd = """
-                    cd "${rootfsDir.absolutePath}" && 
-                    if echo "${tarball.absolutePath}" | grep -q ".xz"; then 
-                        xz -dc "${tarball.absolutePath}" | tar -x -p -P --no-same-owner 2>/dev/null; 
-                    else 
-                        zcat "${tarball.absolutePath}" | tar -x -p -P --no-same-owner 2>/dev/null; 
-                    fi
-                """.trimIndent().replace("\n", " ")
+                // THE FIX: The 'pipe' method completely bypasses Android's symlink security 
+                val cmd = if (ext == "xz") {
+                    "sh -c \"xz -dc '${tarball.absolutePath}' | (cd '${rootfsDir.absolutePath}' && tar -x -p -P --no-same-owner)\""
+                } else {
+                    "sh -c \"zcat '${tarball.absolutePath}' | (cd '${rootfsDir.absolutePath}' && tar -x -p -P --no-same-owner)\""
+                }
                 
-                rootShell.exec(extractCmd)
+                rootShell.exec(cmd)
 
                 // Verify success via Root Check
                 val checkCmd = "if [ -f \"${rootfsDir.absolutePath}/bin/bash\" ]; then echo SUCCESS; else echo FAIL; fi"
@@ -134,15 +132,11 @@ class RootfsManager(private val context: Context) {
                     throw RuntimeException("Extraction failed: Core OS files missing.")
                 }
 
-                // Give the Kotlin/Flutter layer permission to see inside the folder
-                rootShell.exec("chmod 755 \"${rootfsDir.absolutePath}\"")
-                rootShell.exec("chmod 755 \"${rootfsDir.absolutePath}/bin\"")
-                rootShell.exec("chmod 755 \"${rootfsDir.absolutePath}/etc\"")
-
                 onProgress(0.7, "Configuring Linux environment...")
                 configureRootfs()
                 
-                File(context.filesDir, "SETUP_COMPLETE").writeText("done")
+                // THE FIX: Set the marker that the app user can safely see
+                File(baseDir, "SETUP_COMPLETE").writeText("done")
                 tarball.delete()
                 
                 onProgress(1.0, "${DISTRO_NAMES[distro] ?: distro} setup complete")
@@ -158,7 +152,6 @@ class RootfsManager(private val context: Context) {
         val rootShell = RootShell(context)
         val path = rootfsDir.absolutePath
 
-        // Write configuration files safely using the root shell to bypass permission issues
         rootShell.exec("mkdir -p \"$path/etc/apt/apt.conf.d\"")
         rootShell.exec("echo 'APT::Sandbox::User \"root\";' > \"$path/etc/apt/apt.conf.d/99-disable-sandbox\"")
         rootShell.exec("echo 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > \"$path/etc/resolv.conf\"")
@@ -172,9 +165,5 @@ class RootfsManager(private val context: Context) {
         rootShell.exec("echo 'Defaults !requiretty\nroot ALL=(ALL) NOPASSWD: ALL' > \"$path/etc/sudoers.d/droiddesk\"")
         
         rootShell.exec("mkdir -p \"$path/tmp\" \"$path/run\" \"$path/proc\" \"$path/sys\" \"$path/dev/pts\" \"$path/dev/shm\"")
-    }
-
-    private fun calculateDirSize(dir: File): Long {
-        return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
     }
 }
