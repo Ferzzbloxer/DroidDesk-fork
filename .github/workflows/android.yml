@@ -3,12 +3,12 @@ name: Build Android APK
 on:
   push:
     branches:
-      - main
+      - Test-(root) 
     tags:
       - 'v*'
   pull_request:
     branches:
-      - main
+      - Test-(root)
   workflow_dispatch:
 
 jobs:
