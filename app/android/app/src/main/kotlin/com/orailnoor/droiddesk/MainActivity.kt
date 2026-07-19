@@ -42,8 +42,7 @@ class MainActivity : FlutterActivity() {
 
         // 1. INITIALIZE GLOBAL LOGGER
         // This places the log file in the app's accessible external storage
-        val logDir = getExternalFilesDir(null) ?: filesDir
-        globalLogFile = File(logDir, "droiddesk_diagnostic_log.txt")
+        globalLogFile = File(filesDir, "droiddesk_diagnostic_log.txt")
         
         try {
             globalLogFile.writeText("=== DROIDDESK DIAGNOSTIC LOG ===\n")
