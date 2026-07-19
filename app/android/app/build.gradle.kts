@@ -25,7 +25,7 @@ android {
 
     defaultConfig {
         applicationId = "com.orailnoor.droiddesk"
-        minSdk = 28  // Downgraded to 28 to bypass W^X (Write XOR Execute) restrictions on app data
+        minSdk = 24  // Downgraded to 28 to bypass W^X (Write XOR Execute) restrictions on app data
         targetSdk = 28 // API 28 completely disables the Android 10+ execve() block
         versionCode = flutter.versionCode
         versionName = flutter.versionName
