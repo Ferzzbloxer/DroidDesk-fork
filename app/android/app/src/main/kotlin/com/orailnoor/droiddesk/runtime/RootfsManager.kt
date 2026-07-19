@@ -187,34 +187,80 @@ class RootfsManager(private val context: Context) {
                     if (logFile.exists()) {
                         val currentLog = logFile.readText()
                         
-                        // Update UI with raw logs so you can see progress
-                        val lines = currentLog.split("\n")
-                        if (lines.isNotEmpty()) {
-                            onProgress(0.1, lines.last()) 
-                        }
-                        
+fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
+        thread(name = "rootfs-extract") {
+            try {
+                val distro = getInstalledDistro()
+                val tarball = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
+                val rootShell = RootShell(context)
+                
+                if (!tarball.exists()) throw Exception("Tarball not found")
+
+                val scriptFile = File(context.filesDir, "extract_helper.sh")
+                val logFile = File(context.filesDir, "setup_debug.log")
+                if (logFile.exists()) logFile.delete()
+
+                onProgress(0.05, "Preparing root environment...")
+
+                val scriptContent = """
+                    #!/system/bin/sh
+                    DEST="${rootfsDir.absolutePath}"
+                    SRC="${tarball.absolutePath}"
+                    LOG="${logFile.absolutePath}"
+                    
+                    exec > "${'$'}LOG" 2>&1
+                    echo "START_TIME: $(date)"
+                    
+                    rm -rf "${'$'}DEST"
+                    mkdir -p "${'$'}DEST"
+                    cd "${'$'}DEST" || exit 1
+                    
+                    echo "Unpacking Linux Filesystem..."
+                    if echo "${'$'}SRC" | grep -q ".xz"; then
+                        xz -dc "${'$'}SRC" | tar -x -p -P --no-same-owner
+                    else
+                        zcat "${'$'}SRC" | tar -x -p -P --no-same-owner
+                    fi
+                    
+                    # THE FIX: Keep it owned by root (0:0) for Linux compatibility
+                    # But make directories searchable so the app can verify
+                    chown -R 0:0 "${'$'}DEST"
+                    find "${'$'}DEST" -type d -exec chmod 755 {} +
+                    
+                    EXIT_CODE=${'$'}?
+                    echo "PROCESS_FINISHED_CODE: ${'$'}EXIT_CODE"
+                    
+                    if [ -f "${'$'}DEST/bin/bash" ] || [ -f "${'$'}DEST/bin/sh" ]; then
+                        echo "VERIFICATION_RESULT: SUCCESS"
+                    else
+                        echo "VERIFICATION_RESULT: FAILURE"
+                    fi
+                """.trimIndent()
+                
+                scriptFile.writeText(scriptContent)
+                rootShell.exec("chmod 777 \"${scriptFile.absolutePath}\"")
+                onProgress(0.1, "Extracting rootfs...")
+                rootShell.exec("sh \"${scriptFile.absolutePath}\"")
+
+                var finished = false
+                var rootSaysSuccess = false
+                while (!finished) {
+                    if (logFile.exists()) {
+                        val currentLog = logFile.readText()
                         if (currentLog.contains("PROCESS_FINISHED_CODE")) {
                             finished = true
-                            if (currentLog.contains("VERIFICATION_RESULT: SUCCESS")) {
-                                rootSaysSuccess = true
-                            }
+                            if (currentLog.contains("VERIFICATION_RESULT: SUCCESS")) rootSaysSuccess = true
                         }
                     }
                     Thread.sleep(1000)
                 }
 
-                // 5. Final check - Trust the ROOT log, not the Java File object
-                if (!rootSaysSuccess) {
-                    val logTail = if (logFile.exists()) logFile.readText().takeLast(300) else "No Log"
-                    throw Exception("Root check failed. Check logs: $logTail")
-                }
+                if (!rootSaysSuccess) throw Exception("Extraction verification failed.")
 
-                onProgress(0.7, "Configuring Linux OS...")
+                onProgress(0.7, "Configuring Linux...")
                 configureRootfs()
-                
                 File(context.filesDir, "SETUP_COMPLETE").writeText("done")
                 tarball.delete() 
-                
                 onProgress(1.0, "Extraction complete!")
 
             } catch (e: Exception) {
