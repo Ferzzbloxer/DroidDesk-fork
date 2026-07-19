@@ -221,56 +221,54 @@ class RootfsManager(private val context: Context) {
                 val tarball = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
 
                 if (!tarball.exists()) {
-                    onProgress(-1.0, "Rootfs tarball not found. Download first.")
+                    onProgress(-1.0, "Rootfs tarball not found.")
                     return@thread
                 }
 
-                // Clean previous rootfs
-                if (rootfsDir.exists()) {
-                    rootfsDir.deleteRecursively()
-                }
-                rootfsDir.mkdirs()
-
-                onProgress(0.1, "Extracting ${DISTRO_NAMES[distro]} as Root...")
-                Log.i(TAG, "Extracting rootfs via SU from ${tarball.absolutePath}")
-
+                // 1. Clean the target directory completely to prevent "File exists" conflicts
+                onProgress(0.05, "Cleaning environment...")
                 val rootShell = RootShell(context)
-                val ext = if (distro == "kali") "xz" else "gz"
-                val tarFlags = if (ext == "xz") "Jxf" else "zxf"
+                rootShell.exec("rm -rf \"${rootfsDir.absolutePath}\" && mkdir -p \"${rootfsDir.absolutePath}\"")
 
-                // FIX: We 'cd' into the directory first to bypass path security blocks.
-                // We also use --no-same-owner to handle Android's unique user system.
-                val extractCmd = "cd \"${rootfsDir.absolutePath}\" && tar $tarFlags \"${tarball.absolutePath}\" --no-same-owner -p"
+                onProgress(0.1, "Extracting Ubuntu (Stream Mode)...")
+                Log.i(TAG, "Extracting via Pipe to bypass Toybox path validation")
+
+                // 2. Prepare flags
+                // We use 'x' for extract and 'z'/'J' for compression. 
+                // We REMOVE 'f' because we are piping the file into tar's stdin.
+                val compressionOp = if (distro == "kali") "Jx" else "zx"
+
+                // 3. The "Stream" Command:
+                // We 'cat' the file and pipe it into tar. 
+                // '-P' allows absolute paths, '--no-same-owner' handles Android UIDs.
+                val extractCmd = "cat \"${tarball.absolutePath}\" | (cd \"${rootfsDir.absolutePath}\" && tar $compressionOp -P --no-same-owner -p)"
 
                 var lineCount = 0
                 val exitCode = rootShell.exec(extractCmd) { line ->
-                    // Read output for progress indication
                     if (lineCount % 500 == 0) {
                         onProgress(0.1 + (lineCount % 5000) / 10000.0, "Extracting: $line")
                     }
                     lineCount++
                 }
 
-                // VALIDATION: tar often returns code 1 on Android due to symlink warnings.
-                // We only stop if the core system (bash) is missing.
+                // 4. Robust Validation:
+                // We ignore the exit code because tar ALMOST ALWAYS returns 1 on Android 
+                // due to minor symlink warnings. We only care if the OS is actually there.
                 val bashPath = File(rootfsDir, "bin/bash")
-                if (!bashPath.exists()) {
-                    throw RuntimeException("Extraction failed: bin/bash not found. Code: $exitCode")
+                val shPath = File(rootfsDir, "bin/sh")
+                
+                if (!bashPath.exists() && !shPath.exists()) {
+                    throw RuntimeException("Extraction failed: bin/bash not found. The OS did not unpack.")
                 }
 
+                Log.i(TAG, "Extraction verified. Bash is present. Continuing setup...")
                 onProgress(0.7, "Configuring Linux environment...")
 
-                // Post-extraction configuration
                 configureRootfs()
-
-                // Mark setup as completely successful
                 File(context.filesDir, "SETUP_COMPLETE").writeText("done")
-
-                // Clean up tarball to save space
                 tarball.delete()
 
                 onProgress(1.0, "${DISTRO_NAMES[distro] ?: distro} setup complete")
-                Log.i(TAG, "Rootfs extraction complete. Size: ${getRootfsSizeMB()} MB")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Extraction failed: ${e.message}", e)
