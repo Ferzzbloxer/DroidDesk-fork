@@ -232,40 +232,32 @@ class RootfsManager(private val context: Context) {
                 }
                 rootfsDir.mkdirs()
 
-                onProgress(0.1, "Extracting ${DISTRO_NAMES[distro]}...")
-                Log.i(TAG, "Extracting rootfs from ${tarball.absolutePath}")
+                onProgress(0.1, "Extracting ${DISTRO_NAMES[distro]} as Root...")
+                Log.i(TAG, "Extracting rootfs via SU from ${tarball.absolutePath}")
 
-                // Use ProcessBuilder to run tar extraction
-                // Android's toybox includes tar, and we can use xz if available
+                //CHANGES
+                // 1. Initialize RootShell
+                val rootShell = RootShell(context)
+
+                // 2. Prepare tar flags
                 val ext = if (distro == "kali") "xz" else "gz"
                 val tarFlags = if (ext == "xz") "Jxf" else "zxf"
-                val process = ProcessBuilder(
-                    "tar", tarFlags, tarball.absolutePath,
-                    "-C", rootfsDir.absolutePath
-                )
-                    .redirectErrorStream(true)
-                    .start()
 
-                // Read output for progress indication
-                val reader = process.inputStream.bufferedReader()
-                var line: String?
+                // 3. Run the extraction through RootShell (su)
+                // We wrap paths in quotes to handle any potential spaces safely.
                 var lineCount = 0
-                var lastLine = ""
-                while (reader.readLine().also { line = it } != null) {
-                    lastLine = line!!
+                val exitCode = rootShell.exec("tar $tarFlags \"${tarball.absolutePath}\" -C \"${rootfsDir.absolutePath}\"") { line ->
+                    // This callback sends the tar output back to the UI log
                     if (lineCount % 500 == 0) {
                         onProgress(0.1 + (lineCount % 5000) / 10000.0, "Extracting: $line")
                     }
                     lineCount++
                 }
 
-                val exitCode = process.waitFor()
+                // 4. Validate the result
                 val binDir = File(rootfsDir, "bin")
-                
-                // Android's tar will fail (code 1 or 2) when trying to chown files to root or create /dev nodes.
-                // We ignore this as long as the core filesystem extracted successfully.
                 if (exitCode != 0 && (!binDir.exists() || binDir.list()?.isEmpty() == true)) {
-                    throw RuntimeException("tar failed (code $exitCode): $lastLine")
+                    throw RuntimeException("Root extraction failed with code $exitCode")
                 }
 
                 onProgress(0.7, "Configuring Linux environment...")
