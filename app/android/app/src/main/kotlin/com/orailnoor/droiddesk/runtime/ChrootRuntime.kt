@@ -41,12 +41,8 @@ class ChrootRuntime(private val context: Context) {
     }
 
     fun extractRootfs(onProgress: (Double, String) -> Unit) {
-        rootfsManager.extractRootfs { progress, status ->
-            onProgress(progress, status)
-            if (progress == 1.0) {
-                configureChrootRootfs()
-            }
-        }
+        // We removed the configureChrootRootfs call from here to prevent race conditions
+        rootfsManager.extractRootfs(onProgress)
     }
 
     private fun configureChrootRootfs() {
@@ -73,6 +69,7 @@ class ChrootRuntime(private val context: Context) {
         """.trimIndent()
         rootShell.exec("cat << 'EOF' > \"$path/etc/profile.d/droiddesk-ha.sh\"\n$haScript\nEOF")
 
+        // VERY IMPORTANT: Write sources.list so apt-get knows where to download things
         val sources = """
             deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
             deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
@@ -103,29 +100,42 @@ class ChrootRuntime(private val context: Context) {
 
         thread(name = "chroot-de-install") {
             try {
-                onProgress(0.0, "Mounting rootfs...")
+                // 1. Sync Configs synchronously to avoid Race Condition
+                onProgress(0.0, "Configuring Ubuntu for Android...")
+                configureChrootRootfs() 
+
+                // 2. Ensure Mounts
+                onProgress(0.05, "Mounting virtual filesystems...")
                 ensureMounts()
 
-                onProgress(0.05, "Updating package lists...")
+                // 3. Fix Android Network Permissions inside Chroot
+                // Android requires Group 3003 (inet) for internet access. We force this group onto apt.
+                onLog("Adding Android network groups to Linux...\n")
+                execChroot("groupadd -g 3003 inet || true", onLog)
+                execChroot("usermod -aG inet root || true", onLog)
+                execChroot("usermod -aG inet _apt || true", onLog)
+
+                // 4. Update and Install
+                onProgress(0.1, "Updating package lists...")
                 if (execChroot("apt-get -o APT::Sandbox::User=root update -y", onLog) != 0) {
-                    throw IllegalStateException("Package index update failed")
+                    throw IllegalStateException("apt-get update failed. Check network connection.")
                 }
 
-                onProgress(0.1, "Installing core tools...")
+                onProgress(0.2, "Installing core tools...")
                 if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
                             "locales ca-certificates wget curl dbus-x11",
                     onLog
                 ) != 0) throw IllegalStateException("Core package installation failed")
 
-                onProgress(0.2, "Installing Mesa GPU drivers...")
+                onProgress(0.4, "Installing Mesa GPU drivers...")
                 execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
                             "mesa-vulkan-drivers mesa-opencl-icd libgl1-mesa-dri libglx-mesa0 vulkan-tools",
                     onLog
                 )
 
-                onProgress(0.4, "Installing desktop environment...")
+                onProgress(0.6, "Installing $desktopEnv...")
                 val dePackages = when (desktopEnv) {
                     "lxqt" -> "lxqt qterminal pcmanfm-qt featherpad"
                     "mate" -> "mate-desktop-environment mate-terminal"
@@ -137,17 +147,16 @@ class ChrootRuntime(private val context: Context) {
                     onLog
                 ) != 0) throw IllegalStateException("Desktop package installation failed")
 
-                onProgress(0.8, "Installing Desktop Essentials tools...")
+                onProgress(0.8, "Installing Essentials...")
                 if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
                             "git nano htop wget curl python3 python3-pip openssh-client",
                     onLog
-                ) != 0) throw IllegalStateException("Desktop Essentials package installation failed")
+                ) != 0) throw IllegalStateException("Essentials installation failed")
 
                 onProgress(0.9, "Cleaning up...")
                 execChroot("apt-get clean", onLog)
 
-                // Write the marker using root so it doesn't crash on permissions
                 rootShell.exec("echo '$desktopEnv' > \"${rootfsDir.absolutePath}/$CHROOT_DE_MARKER\"")
 
                 onProgress(1.0, "$desktopEnv installed in chroot")
