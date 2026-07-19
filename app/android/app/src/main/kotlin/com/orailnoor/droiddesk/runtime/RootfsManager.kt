@@ -221,58 +221,53 @@ class RootfsManager(private val context: Context) {
                 val tarball = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
 
                 if (!tarball.exists()) {
-                    onProgress(-1.0, "Rootfs tarball not found.")
+                    onProgress(-1.0, "Rootfs tarball not found at ${tarball.absolutePath}")
                     return@thread
                 }
 
-                // 1. Clean the target directory completely to prevent "File exists" conflicts
-                onProgress(0.05, "Cleaning environment...")
+                // 1. Clean and Prepare
+                onProgress(0.05, "Preparing storage...")
                 val rootShell = RootShell(context)
                 rootShell.exec("rm -rf \"${rootfsDir.absolutePath}\" && mkdir -p \"${rootfsDir.absolutePath}\"")
 
-                onProgress(0.1, "Extracting Ubuntu (Stream Mode)...")
-                Log.i(TAG, "Extracting via Pipe to bypass Toybox path validation")
+                onProgress(0.1, "Extracting Ubuntu (Debug Mode)...")
 
-                // 2. Prepare flags
-                // We use 'x' for extract and 'z'/'J' for compression. 
-                // We REMOVE 'f' because we are piping the file into tar's stdin.
-                val compressionOp = if (distro == "kali") "Jx" else "zx"
+                // 2. Identify Compression Tool
+                // Using gunzip/xz directly is more reliable than 'tar -z' on some Android devices
+                val decompressor = if (distro == "kali") "xz -dc" else "gunzip -c"
 
-                // 3. The "Stream" Command:
-                // We 'cat' the file and pipe it into tar. 
-                // '-P' allows absolute paths, '--no-same-owner' handles Android UIDs.
-                val extractCmd = "cat \"${tarball.absolutePath}\" | (cd \"${rootfsDir.absolutePath}\" && tar $compressionOp -P --no-same-owner -p)"
+                // 3. The Debug Command
+                // - We use 'sh -c' to ensure the pipe and redirection work correctly
+                // - '2>&1' forces all errors to show up in your app's log window
+                val extractCmd = "sh -c \"$decompressor '${tarball.absolutePath}' | (cd '${rootfsDir.absolutePath}' && tar -xp -P --no-same-owner) 2>&1\""
 
-                var lineCount = 0
+                Log.i(TAG, "Executing: $extractCmd")
+
+                // We capture EVERY line now to find the hidden error
                 val exitCode = rootShell.exec(extractCmd) { line ->
-                    if (lineCount % 500 == 0) {
-                        onProgress(0.1 + (lineCount % 5000) / 10000.0, "Extracting: $line")
-                    }
-                    lineCount++
+                    // This sends every single line of output (and error) to your UI text box
+                    onProgress(0.1, line) 
                 }
 
-                // 4. Robust Validation:
-                // We ignore the exit code because tar ALMOST ALWAYS returns 1 on Android 
-                // due to minor symlink warnings. We only care if the OS is actually there.
+                // 4. Detailed Validation
                 val bashPath = File(rootfsDir, "bin/bash")
                 val shPath = File(rootfsDir, "bin/sh")
                 
                 if (!bashPath.exists() && !shPath.exists()) {
-                    throw RuntimeException("Extraction failed: bin/bash not found. The OS did not unpack.")
+                    // List files in the directory to log what actually happened
+                    val files = rootfsDir.list()?.joinToString(", ") ?: "empty"
+                    throw RuntimeException("Extraction Failed. bin/bash not found. Files found: $files")
                 }
 
-                Log.i(TAG, "Extraction verified. Bash is present. Continuing setup...")
-                onProgress(0.7, "Configuring Linux environment...")
-
+                onProgress(0.7, "Configuring Linux...")
                 configureRootfs()
                 File(context.filesDir, "SETUP_COMPLETE").writeText("done")
                 tarball.delete()
-
-                onProgress(1.0, "${DISTRO_NAMES[distro] ?: distro} setup complete")
+                onProgress(1.0, "Setup complete")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Extraction failed: ${e.message}", e)
-                onProgress(-1.0, "Extraction failed: ${e.message}")
+                onProgress(-1.0, "Detailed Error: ${e.message}")
             }
         }
     }
