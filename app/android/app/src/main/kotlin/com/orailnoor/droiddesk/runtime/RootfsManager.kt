@@ -123,86 +123,99 @@ class RootfsManager(private val context: Context) {
                 
                 if (!tarball.exists()) throw Exception("Tarball not found")
 
-                // 1. Setup Debug Files
                 val scriptFile = File(context.filesDir, "extract_helper.sh")
                 val logFile = File(context.filesDir, "setup_debug.log")
                 if (logFile.exists()) logFile.delete()
 
                 onProgress(0.05, "Preparing root environment...")
 
-                // 2. Create the Root Helper Script
-                // This bypasses quoting issues and Android's tar security checks
+                // We get the App's UID to give the folder back to the app at the end
+                val appUid = context.applicationInfo.uid
+
                 val scriptContent = """
                     #!/system/bin/sh
                     DEST="${rootfsDir.absolutePath}"
                     SRC="${tarball.absolutePath}"
                     LOG="${logFile.absolutePath}"
                     
-                    # Redirect stdout and stderr to the persistent log file
                     exec > "${'$'}LOG" 2>&1
                     
                     echo "START_TIME: $(date)"
-                    echo "DESTINATION: ${'$'}DEST"
                     
-                    # Clean and create destination
+                    # 1. Clean and Create
                     rm -rf "${'$'}DEST"
                     mkdir -p "${'$'}DEST"
                     cd "${'$'}DEST" || exit 1
                     
+                    # 2. Extract
                     echo "Unpacking Linux Filesystem..."
-                    
-                    # -P allows absolute symlinks, --no-same-owner prevents UID errors
                     if echo "${'$'}SRC" | grep -q ".xz"; then
                         xz -dc "${'$'}SRC" | tar -x -p -P --no-same-owner
                     else
                         zcat "${'$'}SRC" | tar -x -p -P --no-same-owner
                     fi
                     
+                    # 3. THE FIX: Ownership Handshake
+                    # We give the folder back to the app user so Kotlin can 'see' it
+                    chown -R $appUid:$appUid "${'$'}DEST"
+                    chmod -R 755 "${'$'}DEST"
+                    
                     EXIT_CODE=${'$'}?
                     echo "PROCESS_FINISHED_CODE: ${'$'}EXIT_CODE"
                     
+                    # 4. Root-side verification
                     if [ -f "${'$'}DEST/bin/bash" ] || [ -f "${'$'}DEST/bin/sh" ]; then
-                        echo "VERIFICATION: SUCCESS"
+                        echo "VERIFICATION_RESULT: SUCCESS"
                     else
-                        echo "VERIFICATION: FAILURE"
+                        echo "VERIFICATION_RESULT: FAILURE"
                     fi
                 """.trimIndent()
                 
                 scriptFile.writeText(scriptContent)
                 rootShell.exec("chmod 777 \"${scriptFile.absolutePath}\"")
 
-                onProgress(0.1, "Extracting (Check setup_debug.log for details)...")
+                onProgress(0.1, "Extracting...")
 
-                // 3. Execute Script as Root
+                // Run the script
                 rootShell.exec("sh \"${scriptFile.absolutePath}\"")
 
-                // 4. Live Monitor the Log file for UI updates
+                // Monitor the log file
                 var finished = false
+                var rootSaysSuccess = false
+                
                 while (!finished) {
                     if (logFile.exists()) {
                         val currentLog = logFile.readText()
-                        // Show the last few lines in the UI box
-                        val uiSummary = if (currentLog.length > 500) "..." + currentLog.takeLast(500) else currentLog
-                        onProgress(0.1, uiSummary)
                         
-                        if (currentLog.contains("PROCESS_FINISHED_CODE")) finished = true
+                        // Update UI with raw logs so you can see progress
+                        val lines = currentLog.split("\n")
+                        if (lines.isNotEmpty()) {
+                            onProgress(0.1, lines.last()) 
+                        }
+                        
+                        if (currentLog.contains("PROCESS_FINISHED_CODE")) {
+                            finished = true
+                            if (currentLog.contains("VERIFICATION_RESULT: SUCCESS")) {
+                                rootSaysSuccess = true
+                            }
+                        }
                     }
-                    Thread.sleep(1500)
+                    Thread.sleep(1000)
                 }
 
-                // 5. Final Validation
-                if (!File(rootfsDir, "bin/bash").exists() && !File(rootfsDir, "bin/sh").exists()) {
-                    throw Exception("Extraction failed. Core binaries missing. Check setup_debug.log")
+                // 5. Final check - Trust the ROOT log, not the Java File object
+                if (!rootSaysSuccess) {
+                    val logTail = if (logFile.exists()) logFile.readText().takeLast(300) else "No Log"
+                    throw Exception("Root check failed. Check logs: $logTail")
                 }
 
                 onProgress(0.7, "Configuring Linux OS...")
                 configureRootfs()
                 
-                scriptFile.delete() // Cleanup script
                 File(context.filesDir, "SETUP_COMPLETE").writeText("done")
-                tarball.delete() // Save space
+                tarball.delete() 
                 
-                onProgress(1.0, "Extraction successful!")
+                onProgress(1.0, "Extraction complete!")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Rootfs extraction failed", e)
