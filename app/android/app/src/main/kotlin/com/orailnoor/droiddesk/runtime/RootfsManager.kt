@@ -13,15 +13,7 @@ import kotlin.concurrent.thread
 /**
  * Manages Linux rootfs downloads, extraction, and lifecycle.
  *
- * Rootfs images are standard arm64 Linux distributions downloaded from
- * official or community mirrors. They are used only by DroidDesk's rooted
- * chroot path; non-root devices use the native Termux/TUR runtime instead.
- *
- * Download flow:
- *   1. User selects distro in Flutter wizard
- *   2. Download tarball (~300-500 MB compressed) with progress
- *   3. Extract to app's private storage (2-4 GB uncompressed)
- *   4. Configure user, sudo, apt sources
+ * Modified Version: Includes Script-based Root Extraction with persistent logging.
  */
 class RootfsManager(private val context: Context) {
 
@@ -29,8 +21,6 @@ class RootfsManager(private val context: Context) {
         private const val TAG = "RootfsManager"
         private const val BUFFER_SIZE = 8192
 
-        // Official rootfs download URLs (arm64)
-        // Minimal rootfs tarballs reused as rooted chroot filesystems.
         val DISTRO_URLS = mapOf(
             "ubuntu" to "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz",
             "alpine" to "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.0-aarch64.tar.gz",
@@ -50,14 +40,15 @@ class RootfsManager(private val context: Context) {
     private val configFile: File get() = File(baseDir, "distro.conf")
     private val deConfigFile: File get() = File(baseDir, "de.conf")
 
-    // ── Status ──
+    // ── Status Helpers ──
 
-    fun getInstalledDistro(): String {
-        return if (configFile.exists()) configFile.readText().trim() else ""
-    }
+    fun getInstalledDistro(): String = if (configFile.exists()) configFile.readText().trim() else ""
+    fun getInstalledDE(): String = if (deConfigFile.exists()) deConfigFile.readText().trim() else ""
+    fun getRootfsPath(): String = rootfsDir.absolutePath
+    fun getRootfsSizeMB(): Long = if (rootfsDir.exists()) calculateDirSize(rootfsDir) / (1024 * 1024) else 0
 
-    fun getInstalledDE(): String {
-        return if (deConfigFile.exists()) deConfigFile.readText().trim() else ""
+    fun isRootfsReady(): Boolean {
+        return rootfsDir.exists() && File(rootfsDir, "bin").exists() && File(rootfsDir, "etc").exists()
     }
 
     fun getMissingPackages(): List<String> {
@@ -69,390 +60,211 @@ class RootfsManager(private val context: Context) {
             "kde" -> "usr/bin/startplasma-x11"
             else -> "usr/bin/xfce4-session"
         }
-        return if (File(rootfsDir, deBin).exists()) {
-            emptyList()
-        } else {
-            listOf(de)
-        }
+        return if (File(rootfsDir, deBin).exists()) emptyList() else listOf(de)
     }
 
-    fun getRootfsPath(): String {
-        return rootfsDir.absolutePath
-    }
+    // ── Download Logic ──
 
-    fun getRootfsSizeMB(): Long {
-        return if (rootfsDir.exists()) {
-            calculateDirSize(rootfsDir) / (1024 * 1024)
-        } else 0
-    }
-
-    fun isRootfsReady(): Boolean {
-        // Check for critical directories that indicate a valid rootfs
-        return rootfsDir.exists() &&
-                File(rootfsDir, "bin").exists() &&
-                File(rootfsDir, "usr").exists() &&
-                File(rootfsDir, "etc").exists()
-    }
-
-    // ── Download ──
-
-    /**
-     * Download a distro rootfs tarball with progress callbacks.
-     * Runs on a background thread.
-     */
-    fun downloadRootfs(
-        distro: String,
-        onProgress: (progress: Double, status: String) -> Unit
-    ) {
+    fun downloadRootfs(distro: String, onProgress: (Double, String) -> Unit) {
         thread(name = "rootfs-download") {
             try {
-                val url = DISTRO_URLS[distro]
-                    ?: throw IllegalArgumentException("Unknown distro: $distro")
-                val distroName = DISTRO_NAMES[distro] ?: distro
-
+                val url = DISTRO_URLS[distro] ?: throw IllegalArgumentException("Unknown distro")
                 downloadDir.mkdirs()
                 val targetFile = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
-
-                onProgress(0.0, "Connecting to download server...")
-                Log.i(TAG, "Downloading $distroName from $url")
-
+                
                 val connection = URL(url).openConnection() as HttpURLConnection
                 connection.connectTimeout = 30000
-                connection.readTimeout = 30000
                 
                 var downloadedBytes = 0L
                 if (targetFile.exists()) {
                     downloadedBytes = targetFile.length()
                     connection.setRequestProperty("Range", "bytes=$downloadedBytes-")
                 }
-                
-                connection.requestMethod = "GET"
 
-                // Handle redirects or Already Satisfied (416)
                 if (connection.responseCode == 416) {
-                    // Already fully downloaded
-                    onProgress(1.0, "$distroName already downloaded")
+                    onProgress(1.0, "Already downloaded")
                     configFile.writeText(distro)
                     return@thread
                 }
 
-                if (connection.responseCode == HttpURLConnection.HTTP_MOVED_TEMP ||
-                    connection.responseCode == HttpURLConnection.HTTP_MOVED_PERM ||
-                    connection.responseCode == HttpURLConnection.HTTP_SEE_OTHER) {
-                    val redirectUrl = connection.getHeaderField("Location")
-                    connection.disconnect()
-                    val newConnection = URL(redirectUrl).openConnection() as HttpURLConnection
-                    if (downloadedBytes > 0) {
-                        newConnection.setRequestProperty("Range", "bytes=$downloadedBytes-")
-                    }
-                    downloadFromConnection(newConnection, targetFile, distroName, downloadedBytes, onProgress)
-                } else {
-                    // If server ignored Range header (returned 200 instead of 206), we must restart
-                    if (connection.responseCode == 200 && downloadedBytes > 0) {
-                        targetFile.delete()
-                        downloadedBytes = 0L
-                    }
-                    downloadFromConnection(connection, targetFile, distroName, downloadedBytes, onProgress)
-                }
-
-                // Save distro selection
+                downloadFromConnection(connection, targetFile, distro, downloadedBytes, onProgress)
                 configFile.writeText(distro)
-
-                onProgress(1.0, "$distroName downloaded successfully")
-                Log.i(TAG, "Download complete: ${targetFile.absolutePath}")
-
+                onProgress(1.0, "Download complete")
             } catch (e: Exception) {
-                Log.e(TAG, "Download failed: ${e.message}", e)
                 onProgress(-1.0, "Download failed: ${e.message}")
             }
         }
     }
 
-    private fun downloadFromConnection(
-        connection: HttpURLConnection,
-        targetFile: File,
-        distroName: String,
-        initialDownloadedBytes: Long,
-        onProgress: (Double, String) -> Unit
-    ) {
-        var downloadedBytes = initialDownloadedBytes
-        val totalBytes = connection.contentLengthLong
-        val expectedTotal = downloadedBytes + totalBytes
-
-        if (totalBytes == 0L) {
-            onProgress(1.0, "$distroName downloaded successfully")
-            return
-        }
-
-        val buffer = ByteArray(BUFFER_SIZE)
-
-        connection.inputStream.use { input ->
-            FileOutputStream(targetFile, true).use { output ->
-                var bytesRead: Int
-                while (input.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                    downloadedBytes += bytesRead
-                    if (expectedTotal > 0) {
-                        val progress = downloadedBytes.toDouble() / expectedTotal
-                        val downloadedMB = downloadedBytes / (1024 * 1024)
-                        val totalMB = expectedTotal / (1024 * 1024)
-                        onProgress(
-                            progress,
-                            "Downloading $distroName: ${downloadedMB}MB / ${totalMB}MB"
-                        )
-                    }
+    private fun downloadFromConnection(conn: HttpURLConnection, file: File, name: String, start: Long, progress: (Double, String) -> Unit) {
+        var current = start
+        val total = conn.contentLengthLong + start
+        conn.inputStream.use { input ->
+            FileOutputStream(file, true).use { output ->
+                val buffer = ByteArray(BUFFER_SIZE)
+                var read: Int
+                while (input.read(buffer).also { read = it } != -1) {
+                    output.write(buffer, 0, read)
+                    current += read
+                    progress(current.toDouble() / total, "Downloading: ${current / 1024 / 1024}MB / ${total / 1024 / 1024}MB")
                 }
             }
         }
-        connection.disconnect()
     }
 
-    // ── Extraction ──
-    /**
-     * Extract the downloaded rootfs tarball.
-     * Uses RootShell to bypass Android filesystem restrictions.
-     */
-    fun extractRootfs(
-        onProgress: (progress: Double, status: String) -> Unit
-    ) {
+    // ── EXTRACTION LOGIC (The Fixed Part) ──
+
+    fun extractRootfs(onProgress: (progress: Double, status: String) -> Unit) {
         thread(name = "rootfs-extract") {
             try {
                 val distro = getInstalledDistro()
                 val tarball = File(downloadDir, "${distro}-rootfs.tar." + (if (distro == "kali") "xz" else "gz"))
-
-                if (!tarball.exists()) {
-                    onProgress(-1.0, "Rootfs tarball not found at ${tarball.absolutePath}")
-                    return@thread
-                }
-
-                // 1. Clean and Prepare
-                onProgress(0.05, "Preparing storage...")
                 val rootShell = RootShell(context)
-                rootShell.exec("rm -rf \"${rootfsDir.absolutePath}\" && mkdir -p \"${rootfsDir.absolutePath}\"")
-
-                onProgress(0.1, "Extracting Ubuntu (Debug Mode)...")
-
-                // 2. Identify Compression Tool
-                // Using gunzip/xz directly is more reliable than 'tar -z' on some Android devices
-                val decompressor = if (distro == "kali") "xz -dc" else "gunzip -c"
-
-                // 3. The Debug Command
-                // - We use 'sh -c' to ensure the pipe and redirection work correctly
-                // - '2>&1' forces all errors to show up in your app's log window
-                val extractCmd = "sh -c \"$decompressor '${tarball.absolutePath}' | (cd '${rootfsDir.absolutePath}' && tar -xp -P --no-same-owner) 2>&1\""
-
-                Log.i(TAG, "Executing: $extractCmd")
-
-                // We capture EVERY line now to find the hidden error
-                val exitCode = rootShell.exec(extractCmd) { line ->
-                    // This sends every single line of output (and error) to your UI text box
-                    onProgress(0.1, line) 
-                }
-
-                // 4. Detailed Validation
-                val bashPath = File(rootfsDir, "bin/bash")
-                val shPath = File(rootfsDir, "bin/sh")
                 
-                if (!bashPath.exists() && !shPath.exists()) {
-                    // List files in the directory to log what actually happened
-                    val files = rootfsDir.list()?.joinToString(", ") ?: "empty"
-                    throw RuntimeException("Extraction Failed. bin/bash not found. Files found: $files")
+                if (!tarball.exists()) throw Exception("Tarball not found")
+
+                // 1. Setup Debug Files
+                val scriptFile = File(context.filesDir, "extract_helper.sh")
+                val logFile = File(context.filesDir, "setup_debug.log")
+                if (logFile.exists()) logFile.delete()
+
+                onProgress(0.05, "Preparing root environment...")
+
+                // 2. Create the Root Helper Script
+                // This bypasses quoting issues and Android's tar security checks
+                val scriptContent = """
+                    #!/system/bin/sh
+                    DEST="${rootfsDir.absolutePath}"
+                    SRC="${tarball.absolutePath}"
+                    LOG="${logFile.absolutePath}"
+                    
+                    # Redirect stdout and stderr to the persistent log file
+                    exec > "${'$'}LOG" 2>&1
+                    
+                    echo "START_TIME: $(date)"
+                    echo "DESTINATION: ${'$'}DEST"
+                    
+                    # Clean and create destination
+                    rm -rf "${'$'}DEST"
+                    mkdir -p "${'$'}DEST"
+                    cd "${'$'}DEST" || exit 1
+                    
+                    echo "Unpacking Linux Filesystem..."
+                    
+                    # -P allows absolute symlinks, --no-same-owner prevents UID errors
+                    if echo "${'$'}SRC" | grep -q ".xz"; then
+                        xz -dc "${'$'}SRC" | tar -x -p -P --no-same-owner
+                    else
+                        zcat "${'$'}SRC" | tar -x -p -P --no-same-owner
+                    fi
+                    
+                    EXIT_CODE=${'$'}?
+                    echo "PROCESS_FINISHED_CODE: ${'$'}EXIT_CODE"
+                    
+                    if [ -f "${'$'}DEST/bin/bash" ] || [ -f "${'$'}DEST/bin/sh" ]; then
+                        echo "VERIFICATION: SUCCESS"
+                    else
+                        echo "VERIFICATION: FAILURE"
+                    fi
+                """.trimIndent()
+                
+                scriptFile.writeText(scriptContent)
+                rootShell.exec("chmod 777 \"${scriptFile.absolutePath}\"")
+
+                onProgress(0.1, "Extracting (Check setup_debug.log for details)...")
+
+                // 3. Execute Script as Root
+                rootShell.exec("sh \"${scriptFile.absolutePath}\"")
+
+                // 4. Live Monitor the Log file for UI updates
+                var finished = false
+                while (!finished) {
+                    if (logFile.exists()) {
+                        val currentLog = logFile.readText()
+                        // Show the last few lines in the UI box
+                        val uiSummary = if (currentLog.length > 500) "..." + currentLog.takeLast(500) else currentLog
+                        onProgress(0.1, uiSummary)
+                        
+                        if (currentLog.contains("PROCESS_FINISHED_CODE")) finished = true
+                    }
+                    Thread.sleep(1500)
                 }
 
-                onProgress(0.7, "Configuring Linux...")
+                // 5. Final Validation
+                if (!File(rootfsDir, "bin/bash").exists() && !File(rootfsDir, "bin/sh").exists()) {
+                    throw Exception("Extraction failed. Core binaries missing. Check setup_debug.log")
+                }
+
+                onProgress(0.7, "Configuring Linux OS...")
                 configureRootfs()
+                
+                scriptFile.delete() // Cleanup script
                 File(context.filesDir, "SETUP_COMPLETE").writeText("done")
-                tarball.delete()
-                onProgress(1.0, "Setup complete")
+                tarball.delete() // Save space
+                
+                onProgress(1.0, "Extraction successful!")
 
             } catch (e: Exception) {
-                Log.e(TAG, "Extraction failed: ${e.message}", e)
-                onProgress(-1.0, "Detailed Error: ${e.message}")
+                Log.e(TAG, "Rootfs extraction failed", e)
+                onProgress(-1.0, "Error: ${e.message}")
             }
         }
     }
 
-    // ── Post-install Configuration ──
-    /**
-     * Configure the extracted rootfs with essential settings.
-     * Sets up user, sudo, apt sources, DNS, and environment.
-     */
-    private fun configureRootfs() {
-        Log.i(TAG, "Configuring rootfs...")
+    // ── Configuration Logic ──
 
-        // DNS resolution
+    private fun configureRootfs() {
+        // DNS
         File(rootfsDir, "etc/resolv.conf").apply {
             parentFile?.mkdirs()
-            writeText("""
-                nameserver 8.8.8.8
-                nameserver 8.8.4.4
-                nameserver 1.1.1.1
-            """.trimIndent())
+            writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
         }
 
-        // Disable apt sandbox (CRITICAL for Android)
-        // If apt drops to the _apt user, it loses the Android 'inet' group and hangs indefinitely without network access.
-        val aptConfDir = File(rootfsDir, "etc/apt/apt.conf.d")
-        aptConfDir.mkdirs()
-        File(aptConfDir, "99-disable-sandbox").writeText("APT::Sandbox::User \"root\";\n")
+        // Fix Apt for Android (Network Fix)
+        val aptConf = File(rootfsDir, "etc/apt/apt.conf.d/99-android")
+        aptConf.parentFile?.mkdirs()
+        aptConf.writeText("APT::Sandbox::User \"root\";\n")
 
-        // Hostname
-        File(rootfsDir, "etc/hostname").writeText("droiddesk\n")
+        // DroidDesk Environment Profile
+        File(rootfsDir, "etc/profile.d/droiddesk.sh").writeText("""
+            export DISPLAY=:0
+            export PULSE_SERVER=127.0.0.1
+            export XDG_RUNTIME_DIR=/tmp/runtime-root
+            mkdir -p /tmp/runtime-root 2>/dev/null
+            export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+        """.trimIndent())
 
-        // Hosts file
-        File(rootfsDir, "etc/hosts").apply {
-            parentFile?.mkdirs()
-            writeText("""
-                127.0.0.1   localhost
-                127.0.0.1   droiddesk
-                ::1         localhost ip6-localhost ip6-loopback
-            """.trimIndent())
-        }
-
-        // Environment variables for the Linux session
-        File(rootfsDir, "etc/profile.d/droiddesk.sh").apply {
-            parentFile?.mkdirs()
-            writeText("""
-                #!/bin/bash
-                # DroidDesk environment configuration
-                export DISPLAY=:0
-                export PULSE_SERVER=127.0.0.1
-                export MESA_NO_ERROR=1
-                export MESA_GL_VERSION_OVERRIDE=4.6
-                export MESA_GLES_VERSION_OVERRIDE=3.2
-                export GALLIUM_DRIVER=zink
-                export MESA_LOADER_DRIVER_OVERRIDE=zink
-                export TU_DEBUG=noconform
-                export ZINK_DESCRIPTORS=lazy
-                export MESA_VK_WSI_PRESENT_MODE=immediate
-                
-                # XDG directories
-                export XDG_RUNTIME_DIR=/tmp/runtime-root
-                mkdir -p "${'$'}XDG_RUNTIME_DIR" 2>/dev/null
-                
-                # Color prompt
-                export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
-                
-                alias ll='ls -la --color=auto'
-                alias update='apt update && apt upgrade -y'
-            """.trimIndent())
-        }
-
-        // Sudo configuration (passwordless for root)
-        File(rootfsDir, "etc/sudoers.d/droiddesk").apply {
-            parentFile?.mkdirs()
-            writeText("""
-                Defaults !requiretty
-                root ALL=(ALL) NOPASSWD: ALL
-            """.trimIndent())
-        }
-
-        // Create required directories
-        listOf(
-            "tmp",
-            "tmp/runtime-root",
-            "run",
-            "var/run",
-            "dev/shm"
-        ).forEach {
+        // Create virtual nodes
+        listOf("tmp", "run", "proc", "sys", "dev", "dev/pts", "dev/shm").forEach {
             File(rootfsDir, it).mkdirs()
         }
-
-        Log.i(TAG, "Rootfs configuration complete")
     }
 
-    // ── Desktop Environment Installation ──
-
-    /**
-     * Install a desktop environment inside the rootfs using apt.
-     * Called after rootfs extraction.
-     */
-    fun installDesktopEnvironment(
-        de: String,
-        runtime: LinuxRuntime,
-        onProgress: (Double, String) -> Unit,
-        onLog: (String) -> Unit
-    ) {
+    fun installDesktopEnvironment(de: String, runtime: LinuxRuntime, onProgress: (Double, String) -> Unit, onLog: (String) -> Unit) {
         thread(name = "de-install") {
             try {
-                // Forcefully release any stuck apt locks before starting
-                onProgress(0.0, "Clearing package manager locks...")
-                try {
-                    runtime.executeCommand("""
-                        killall -9 apt apt-get dpkg 2>/dev/null || true
-                        rm -f /var/lib/apt/lists/lock
-                        rm -f /var/cache/apt/archives/lock
-                        rm -f /var/lib/dpkg/lock*
-                        dpkg --configure -a
-                    """.trimIndent(), onLog)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Lock clearing failed, continuing anyway: ${e.message}")
-                }
+                onProgress(0.1, "Updating repositories...")
+                runtime.executeCommand("apt-get update", onLog)
                 
-                onProgress(0.0, "Updating package lists...")
-                runtime.executeCommand("apt-get update -y", onLog)
-                
-                // Pre-configure Firefox PPA to fix Ubuntu snap issue
-                onProgress(0.1, "Configuring repositories...")
-                runtime.executeCommand("""
-                    DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y software-properties-common wget gpg
-                    add-apt-repository ppa:mozillateam/ppa -y
-                    echo "Package: *" > /etc/apt/preferences.d/mozilla-firefox
-                    echo "Pin: release o=LP-PPA-mozillateam" >> /etc/apt/preferences.d/mozilla-firefox
-                    echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/mozilla-firefox
-                    
-                    # Add Microsoft repository for VS Code
-                    mkdir -p /etc/apt/keyrings
-                    wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
-                    install -D -o root -g root -m 644 packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg
-                    echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list
-                    rm -f packages.microsoft.gpg
-                    
-                    apt-get update -y
-                """.trimIndent(), onLog)
-
-                var packages = when (de) {
-                    "xfce4" -> "xfce4 xfce4-terminal xfce4-whiskermenu-plugin thunar mousepad dbus-x11"
-                    "lxqt" -> "lxqt qterminal pcmanfm-qt featherpad dbus-x11"
-                    "mate" -> "mate-desktop-environment mate-terminal dbus-x11"
-                    "kde" -> "plasma-desktop konsole dolphin dbus-x11"
-                    else -> "xfce4 xfce4-terminal dbus-x11"
-                }
-                
-                // Fix broken dependencies from interrupted apt installs
-                runtime.executeCommand("DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -f -y", onLog)
-
-                onProgress(0.2, "Installing $de packages...")
-                runtime.executeCommand(
-                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends $packages", onLog
-                )
-
-                onProgress(0.8, "Installing core utilities...")
-                val result = runtime.executeCommand(
-                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends " +
-                    "git wget curl python3 python3-pip htop nano sudo libgl1 x11-xserver-utils", onLog
-                )
-
-                onProgress(0.9, "Configuring embedded X11 display...")
-                
-                if (result.contains("E: ")) {
-                    throw Exception("Apt-get failed: Check terminal output.")
+                val pkgs = when (de) {
+                    "xfce4" -> "xfce4 xfce4-terminal dbus-x11"
+                    "lxqt" -> "lxqt qterminal dbus-x11"
+                    "mate" -> "mate-desktop-environment dbus-x11"
+                    else -> "xfce4 dbus-x11"
                 }
 
+                onProgress(0.3, "Installing $de Desktop...")
+                runtime.executeCommand("DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs", onLog)
+                
                 deConfigFile.writeText(de)
-                onProgress(1.0, "$de installation complete!")
-
+                onProgress(1.0, "Desktop installed!")
             } catch (e: Exception) {
-                Log.e(TAG, "DE installation failed: ${e.message}", e)
-                onProgress(-1.0, "Installation failed: ${e.message}")
+                onProgress(-1.0, "DE Install failed: ${e.message}")
             }
         }
     }
 
-    // ── Utility ──
-
     private fun calculateDirSize(dir: File): Long {
-        if (!dir.exists()) return 0
         return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
     }
 }
