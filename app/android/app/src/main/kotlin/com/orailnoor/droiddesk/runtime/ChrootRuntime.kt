@@ -279,9 +279,10 @@ class ChrootRuntime(private val context: Context) {
     }
 
     private fun execChroot(command: String, onLog: (String) -> Unit = {}): Int {
-        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; $command"
-        return rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}", onLog)
-    }
+    // We explicitly overwrite the leaked Android paths to keep them safely inside Linux
+    val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export TMPDIR=/tmp; export TEMP=/tmp; export TMP=/tmp; export HOME=/root; $command"
+    return rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}", onLog)
+}
 
     private fun shellQuote(input: String): String = "'" + input.replace("'", "'\"'\"'") + "'"
 }
