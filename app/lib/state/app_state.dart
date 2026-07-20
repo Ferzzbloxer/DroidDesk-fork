@@ -73,11 +73,7 @@ class AppState extends ChangeNotifier {
   bool get isDEInstalled => _installedDE.isNotEmpty;
 
   String get gpuType {
-    final vendor = _deviceInfo['gpuVendor']?.toString() ?? '';
-    if (vendor.contains('adreno')) return 'Adreno (Snapdragon)';
-    if (vendor.contains('mali')) return 'Mali (MediaTek/Exynos)';
-    if (vendor.contains('powervr')) return 'PowerVR';
-    return 'Unknown GPU';
+    return _deviceInfo['gpuVendor']?.toString() ?? 'Unknown GPU';
   }
 
   // ── Initialization ──
