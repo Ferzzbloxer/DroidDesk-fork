@@ -25,7 +25,6 @@ class ChrootRuntime(private val context: Context) {
     fun hasRoot(): Boolean = rootShell.hasRoot()
     fun isRootfsReady(): Boolean = rootfsManager.isRootfsReady()
     
-    // Ask Root Shell if desktop is installed to avoid Java sandbox permission issues
     fun isDesktopInstalled(): Boolean {
         val marker = File(context.filesDir, CHROOT_DE_MARKER)
         return marker.exists() || rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/startxfce4\" ]; then echo 1; else echo 0; fi").trim() == "1"
@@ -35,7 +34,20 @@ class ChrootRuntime(private val context: Context) {
     fun getRootfsPath(): String = rootfsDir.absolutePath
     fun getRootfsSizeMB(): Long = rootfsManager.getRootfsSizeMB()
 
-    fun getOptionalAppsStatus(): Map<String, Boolean> = mapOf()
+    // FIX: Safely check for optional apps using the Root Shell
+    fun getOptionalAppsStatus(): Map<String, Boolean> {
+        val firefox = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/firefox\" ]; then echo 1; fi").trim() == "1"
+        val code = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/code\" ]; then echo 1; fi").trim() == "1"
+        val node = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/node\" ]; then echo 1; fi").trim() == "1"
+        val magick = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/convert\" ] || [ -f \"${rootfsDir.absolutePath}/usr/bin/magick\" ]; then echo 1; fi").trim() == "1"
+        
+        return mapOf(
+            "firefox" to firefox,
+            "code_oss" to code,
+            "nodejs" to node,
+            "imagemagick" to magick
+        )
+    }
 
     fun downloadRootfs(onProgress: (Double, String) -> Unit) {
         rootfsManager.downloadRootfs("ubuntu", onProgress)
@@ -44,7 +56,6 @@ class ChrootRuntime(private val context: Context) {
     fun extractRootfs(onProgress: (Double, String) -> Unit) {
         rootfsManager.extractRootfs { progress, status ->
             if (progress == 1.0) {
-                // Call configuration synchronously before releasing latch to avoid Race Condition
                 configureChrootRootfs()
             }
             onProgress(progress, status)
@@ -58,6 +69,9 @@ class ChrootRuntime(private val context: Context) {
 
     private fun configureChrootRootfs() {
         Log.i(TAG, "Applying chroot-specific rootfs configuration")
+        val path = rootfsDir.absolutePath
+
+        rootShell.exec("mkdir -p \"$path/etc/profile.d\" \"$path/etc/apt/apt.conf.d\"")
 
         val haScript = """
             export DISPLAY=:0
@@ -107,14 +121,12 @@ class ChrootRuntime(private val context: Context) {
 
         thread(name = "chroot-de-install") {
             try {
-                // Ensure config files are generated synchronously before we start
                 onProgress(0.0, "Configuring Ubuntu for Android...")
                 configureChrootRootfs()
 
                 onProgress(0.05, "Mounting virtual filesystems...")
                 ensureMounts()
 
-                // Fix Android Network permissions for Linux package manager
                 onLog("Adding Android network groups to Linux...\n")
                 execChroot("groupadd -g 3003 inet || true", onLog)
                 execChroot("usermod -aG inet root || true", onLog)
@@ -161,7 +173,6 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.9, "Cleaning up...")
                 execChroot("apt-get clean", onLog)
 
-                // Write the marker to App-private baseDir instead of Rootfs, avoiding Permission Denied
                 File(baseDir, CHROOT_DE_MARKER).writeText(desktopEnv)
 
                 onProgress(1.0, "$desktopEnv installed in chroot")
@@ -173,17 +184,54 @@ class ChrootRuntime(private val context: Context) {
         }
     }
 
+    // FIX: Restored the Optional Apps installation logic!
     fun installOptionalApp(appId: String, onProgress: (Double, String) -> Unit = { _, _ -> }, onLog: (String) -> Unit = {}): Boolean {
-        return true
+        if (!hasRoot() || !isRootfsReady()) return false
+        
+        return try {
+            ensureMounts()
+            execChroot("dpkg --configure -a", onLog) // Fix interrupted installs
+            
+            val command = when (appId) {
+                "firefox" -> """
+                    set -e
+                    export DEBIAN_FRONTEND=noninteractive
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ca-certificates wget gpg
+                    install -d -m 0755 /etc/apt/keyrings
+                    wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /etc/apt/keyrings/packages.mozilla.org.asc
+                    echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' > /etc/apt/sources.list.d/mozilla.list
+                    printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' > /etc/apt/preferences.d/mozilla
+                    apt-get -o APT::Sandbox::User=root update -y
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends firefox
+                """.trimIndent()
+                "code_oss" -> """
+                    set -e
+                    export DEBIAN_FRONTEND=noninteractive
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ca-certificates wget gpg apt-transport-https
+                    install -d -m 0755 /etc/apt/keyrings
+                    wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/packages.microsoft.gpg
+                    echo 'deb [arch=arm64 signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main' > /etc/apt/sources.list.d/vscode.list
+                    apt-get -o APT::Sandbox::User=root update -y
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends code
+                """.trimIndent()
+                "nodejs" -> "DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root update -y && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends nodejs npm"
+                "imagemagick" -> "DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root update -y && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends imagemagick"
+                else -> return false
+            }
+            
+            val exitCode = execChroot(command, onLog)
+            exitCode == 0
+        } catch (e: Exception) {
+            Log.e(TAG, "Optional app installation failed: $appId", e)
+            false
+        }
     }
 
     fun startSession(desktopEnv: String = "xfce4", width: Int = 1920, height: Int = 1080) {
         if (!hasRoot() || !isRootfsReady() || isRunning()) return
 
-        // THE FIX: Cleanup any stale lock files from previous crashes that freeze the Window Manager
-        rootShell.exec("rm -f \"${rootfsDir.absolutePath}/tmp/.X0-lock\" \"${rootfsDir.absolutePath}/tmp/.X11-unix/X0\" \"${rootfsDir.absolutePath}/tmp/dbus-session\" 2>/dev/null")
-
-        // Temporary open permissions for the /root home folder so Kotlin File operations can install UI configs
+        // FIX: Clean corrupted caches from previous crashes before starting
+        rootShell.exec("rm -rf \"${rootfsDir.absolutePath}/root/.cache/sessions\"/* 2>/dev/null")
         rootShell.exec("mkdir -p \"${rootfsDir.absolutePath}/root\" && chmod -R 777 \"${rootfsDir.absolutePath}/root\"")
 
         if (desktopEnv == "xfce4") {
@@ -195,7 +243,6 @@ class ChrootRuntime(private val context: Context) {
             )
         }
 
-        // Restore Linux standard permissions to the home directory for safety
         rootShell.exec("chmod -R 750 \"${rootfsDir.absolutePath}/root\"")
 
         ensureMounts()
@@ -241,8 +288,14 @@ class ChrootRuntime(private val context: Context) {
     }
 
     fun stopSession() {
+        // 1. Kill the Android wrapper process
         sessionProcess?.destroyForcibly()
         sessionProcess = null
+        
+        // FIX: 2. Force-kill the orphaned Linux ghost processes so the next launch is clean!
+        rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c 'killall -9 xfce4-session xfwm4 xfdesktop xfce4-panel dbus-daemon lxqt-session startplasma-x11 kwin_x11 2>/dev/null'")
+        
+        // 3. Unmount virtual filesystems safely
         unmountAll()
     }
 
@@ -299,7 +352,6 @@ class ChrootRuntime(private val context: Context) {
     }
 
     private fun execChroot(command: String, onLog: (String) -> Unit = {}): Int {
-        // Overwrite leaked Android TMPDIR and HOME directories inside the non-login interactive chroot execution
         val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export TMPDIR=/tmp; export TEMP=/tmp; export TMP=/tmp; export HOME=/root; $command"
         return rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}", onLog)
     }
