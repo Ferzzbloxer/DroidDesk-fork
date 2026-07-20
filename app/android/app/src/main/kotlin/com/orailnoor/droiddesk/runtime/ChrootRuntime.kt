@@ -146,7 +146,7 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.4, "Installing Mesa GPU drivers...")
                 execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
-                            "mesa-vulkan-drivers mesa-opencl-icd libgl1-mesa-dri libglx-mesa0 vulkan-tools",
+                            "mesa-vulkan-drivers mesa-opencl-icd libgl1 libgl1-mesa-dri libglx-mesa0 vulkan-tools",
                     onLog
                 )
 
