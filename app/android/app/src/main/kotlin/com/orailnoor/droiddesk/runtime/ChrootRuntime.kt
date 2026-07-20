@@ -25,8 +25,12 @@ class ChrootRuntime(private val context: Context) {
     fun hasRoot(): Boolean = rootShell.hasRoot()
     fun isRootfsReady(): Boolean = rootfsManager.isRootfsReady()
     
-    // THE FIX: Check the marker in baseDir instead of rootfsDir
-    fun isDesktopInstalled(): Boolean = File(baseDir, CHROOT_DE_MARKER).exists()
+    // Ask Root Shell if desktop is installed to avoid Java sandbox permission issues
+    fun isDesktopInstalled(): Boolean {
+        val marker = File(context.filesDir, CHROOT_DE_MARKER)
+        return marker.exists() || rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/startxfce4\" ]; then echo 1; else echo 0; fi").trim() == "1"
+    }
+    
     fun isRunning(): Boolean = sessionProcess?.isAlive == true
     fun getRootfsPath(): String = rootfsDir.absolutePath
     fun getRootfsSizeMB(): Long = rootfsManager.getRootfsSizeMB()
@@ -38,14 +42,22 @@ class ChrootRuntime(private val context: Context) {
     }
 
     fun extractRootfs(onProgress: (Double, String) -> Unit) {
-        rootfsManager.extractRootfs(onProgress)
+        rootfsManager.extractRootfs { progress, status ->
+            if (progress == 1.0) {
+                // Call configuration synchronously before releasing latch to avoid Race Condition
+                configureChrootRootfs()
+            }
+            onProgress(progress, status)
+        }
+    }
+
+    private fun writeRootFile(file: File, content: String) {
+        rootShell.exec("mkdir -p \"${file.parentFile?.absolutePath}\"")
+        rootShell.exec("cat << 'EOF' > \"${file.absolutePath}\"\n$content\nEOF")
     }
 
     private fun configureChrootRootfs() {
         Log.i(TAG, "Applying chroot-specific rootfs configuration")
-        val path = rootfsDir.absolutePath
-
-        rootShell.exec("mkdir -p \"$path/etc/profile.d\" \"$path/etc/apt/apt.conf.d\"")
 
         val haScript = """
             export DISPLAY=:0
@@ -63,14 +75,14 @@ class ChrootRuntime(private val context: Context) {
             export LANGUAGE=C.UTF-8
             export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\\[\033[01;34m\]\w\[\033[00m\]\$ '
         """.trimIndent()
-        rootShell.exec("cat << 'EOF' > \"$path/etc/profile.d/droiddesk-ha.sh\"\n$haScript\nEOF")
+        writeRootFile(File(rootfsDir, "etc/profile.d/droiddesk-ha.sh"), haScript)
 
         val sources = """
             deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
             deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
             deb http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
         """.trimIndent()
-        rootShell.exec("cat << 'EOF' > \"$path/etc/apt/sources.list\"\n$sources\nEOF")
+        writeRootFile(File(rootfsDir, "etc/apt/sources.list"), sources)
 
         val aptConf = """
             Acquire::Retries "3";
@@ -78,7 +90,7 @@ class ChrootRuntime(private val context: Context) {
             Acquire::https::Timeout "30";
             DPkg::Lock::Timeout "60";
         """.trimIndent()
-        rootShell.exec("cat << 'EOF' > \"$path/etc/apt/apt.conf.d/99-droiddesk-reliability\"\n$aptConf\nEOF")
+        writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-droiddesk-reliability"), aptConf)
 
         Log.i(TAG, "Chroot rootfs configuration complete")
     }
@@ -95,13 +107,14 @@ class ChrootRuntime(private val context: Context) {
 
         thread(name = "chroot-de-install") {
             try {
+                // Ensure config files are generated synchronously before we start
                 onProgress(0.0, "Configuring Ubuntu for Android...")
                 configureChrootRootfs()
 
                 onProgress(0.05, "Mounting virtual filesystems...")
                 ensureMounts()
 
-                // Fix Android Network Permissions inside Chroot
+                // Fix Android Network permissions for Linux package manager
                 onLog("Adding Android network groups to Linux...\n")
                 execChroot("groupadd -g 3003 inet || true", onLog)
                 execChroot("usermod -aG inet root || true", onLog)
@@ -148,7 +161,7 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.9, "Cleaning up...")
                 execChroot("apt-get clean", onLog)
 
-                // THE FIX: Save the marker to the baseDir so the App User can verify it exists later
+                // Write the marker to App-private baseDir instead of Rootfs, avoiding Permission Denied
                 File(baseDir, CHROOT_DE_MARKER).writeText(desktopEnv)
 
                 onProgress(1.0, "$desktopEnv installed in chroot")
@@ -167,6 +180,10 @@ class ChrootRuntime(private val context: Context) {
     fun startSession(desktopEnv: String = "xfce4", width: Int = 1920, height: Int = 1080) {
         if (!hasRoot() || !isRootfsReady() || isRunning()) return
 
+        // THE FIX: Cleanup any stale lock files from previous crashes that freeze the Window Manager
+        rootShell.exec("rm -f \"${rootfsDir.absolutePath}/tmp/.X0-lock\" \"${rootfsDir.absolutePath}/tmp/.X11-unix/X0\" \"${rootfsDir.absolutePath}/tmp/dbus-session\" 2>/dev/null")
+
+        // Temporary open permissions for the /root home folder so Kotlin File operations can install UI configs
         rootShell.exec("mkdir -p \"${rootfsDir.absolutePath}/root\" && chmod -R 777 \"${rootfsDir.absolutePath}/root\"")
 
         if (desktopEnv == "xfce4") {
@@ -177,6 +194,9 @@ class ChrootRuntime(private val context: Context) {
                 wallpaperPathInSession = "/usr/share/backgrounds/droiddesk/ubuntu-touch.jpg"
             )
         }
+
+        // Restore Linux standard permissions to the home directory for safety
+        rootShell.exec("chmod -R 750 \"${rootfsDir.absolutePath}/root\"")
 
         ensureMounts()
         bindX11Socket()
@@ -279,10 +299,10 @@ class ChrootRuntime(private val context: Context) {
     }
 
     private fun execChroot(command: String, onLog: (String) -> Unit = {}): Int {
-    // We explicitly overwrite the leaked Android paths to keep them safely inside Linux
-    val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export TMPDIR=/tmp; export TEMP=/tmp; export TMP=/tmp; export HOME=/root; $command"
-    return rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}", onLog)
-}
+        // Overwrite leaked Android TMPDIR and HOME directories inside the non-login interactive chroot execution
+        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export TMPDIR=/tmp; export TEMP=/tmp; export TMP=/tmp; export HOME=/root; $command"
+        return rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}", onLog)
+    }
 
     private fun shellQuote(input: String): String = "'" + input.replace("'", "'\"'\"'") + "'"
 }
