@@ -1,467 +1,365 @@
-import 'package:flutter/material.dart';
-import 'package:droiddesk/services/platform_bridge.dart';
+package com.orailnoor.droiddesk.runtime
 
-/// Central state management for the entire DroidDesk app.
-class AppState extends ChangeNotifier {
-  // ── Setup State ──
-  bool _isBootstrapped = false;
-  bool _isRunning = false;
-  bool _hasRoot = false;
-  String _installedDistro = '';
-  String _installedDE = '';
-  String _selectedDistro = 'ubuntu';
-  String _selectedDE = 'xfce4';
-  int _setupStep = 0; // 0=welcome, 1=distro, 2=de, 3=install, 4=done
+import android.content.Context
+import android.util.Log
+import java.io.File
+import kotlin.concurrent.thread
 
-  // ── Download/Install Progress ──
-  double _downloadProgress = 0.0;
-  String _downloadStatus = '';
-  double _extractProgress = 0.0;
-  String _extractStatus = '';
-  bool _isDownloading = false;
-  bool _isExtracting = false;
-  bool _isInstallingDE = false;
-  String? _statusMessage;
-  String _setupLog = '';
-  Map<String, bool> _optionalApps = {};
-  String? _installingOptionalApp;
-  double _optionalInstallProgress = 0.0;
-  String _optionalInstallStatus = '';
-  String _optionalInstallLog = '';
-  bool _isProotTerminal = false;
+class ChrootRuntime(private val context: Context) {
 
-  // Terminal history
-  final List<String> _terminalOutput = [
-    'DroidDesk Linux Terminal\nType commands below.\n',
-  ];
-  List<String> get terminalOutput => _terminalOutput;
+    companion object {
+        private const val TAG = "ChrootRuntime"
+        private const val CHROOT_DE_MARKER = ".chroot_de_installed"
 
-  // ── Device Info ──
-  Map<String, dynamic> _deviceInfo = {};
+        @Volatile private var sessionProcess: Process? = null
+    }
 
-  // ── Error State ──
-  String? _errorMessage;
+    private val rootShell = RootShell(context)
+    private val rootfsManager = RootfsManager(context)
 
-  // ── Getters ──
-  bool get isBootstrapped => _isBootstrapped;
-  bool get isRunning => _isRunning;
-  bool get hasRoot => _hasRoot;
-  String get installedDistro => _installedDistro;
-  String get installedDE => _installedDE;
-  String get selectedDistro => _selectedDistro;
-  String get selectedDE => _selectedDE;
-  int get setupStep => _setupStep;
-  double get downloadProgress => _downloadProgress;
-  String get downloadStatus => _downloadStatus;
-  double get extractProgress => _extractProgress;
-  String get extractStatus => _extractStatus;
-  String? get statusMessage => _statusMessage;
-  String get setupLog => _setupLog;
-  bool get isDownloading => _isDownloading;
-  bool get isExtracting => _isExtracting;
-  bool get isInstallingDE => _isInstallingDE;
-  Map<String, dynamic> get deviceInfo => _deviceInfo;
-  String? get errorMessage => _errorMessage;
-  Map<String, bool> get optionalApps => _optionalApps;
-  String? get installingOptionalApp => _installingOptionalApp;
-  double get optionalInstallProgress => _optionalInstallProgress;
-  String get optionalInstallStatus => _optionalInstallStatus;
-  String get optionalInstallLog => _optionalInstallLog;
-  bool get isProotTerminal => _isProotTerminal;
+    private val baseDir: File get() = context.filesDir
+    private val rootfsDir: File get() = File(baseDir, "rootfs")
+    private val tmpDir: File get() = File(baseDir, "tmp")
+    private val x11HostDir: File get() = File(tmpDir, ".X11-unix")
 
-  bool get isSetupComplete => _isBootstrapped && _installedDE.isNotEmpty;
-  bool get isDEInstalled => _installedDE.isNotEmpty;
+    fun hasRoot(): Boolean = rootShell.hasRoot()
+    fun isRootfsReady(): Boolean = rootfsManager.isRootfsReady()
+    
+    fun isDesktopInstalled(): Boolean {
+        val marker = File(context.filesDir, CHROOT_DE_MARKER)
+        return marker.exists() || rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/startxfce4\" ]; then echo 1; else echo 0; fi").trim() == "1"
+    }
+    
+    fun isRunning(): Boolean = sessionProcess?.isAlive == true
+    fun getRootfsPath(): String = rootfsDir.absolutePath
+    fun getRootfsSizeMB(): Long = rootfsManager.getRootfsSizeMB()
 
-  String get gpuType {
-    final vendor = _deviceInfo['gpuVendor']?.toString() ?? '';
-    if (vendor.contains('adreno')) return 'Adreno (Snapdragon)';
-    if (vendor.contains('mali')) return 'Mali (MediaTek/Exynos)';
-    if (vendor.contains('powervr')) return 'PowerVR';
-    return 'Unknown GPU';
-  }
+    fun getOptionalAppsStatus(): Map<String, Boolean> {
+        val firefox = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/firefox\" ]; then echo 1; fi").trim() == "1"
+        val code = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/code\" ]; then echo 1; fi").trim() == "1"
+        val node = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/node\" ]; then echo 1; fi").trim() == "1"
+        val magick = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/convert\" ] || [ -f \"${rootfsDir.absolutePath}/usr/bin/magick\" ]; then echo 1; fi").trim() == "1"
+        
+        return mapOf(
+            "firefox" to firefox,
+            "code_oss" to code,
+            "nodejs" to node,
+            "imagemagick" to magick
+        )
+    }
 
-  // ── Initialization ──
+    fun downloadRootfs(onProgress: (Double, String) -> Unit) {
+        rootfsManager.downloadRootfs("ubuntu", onProgress)
+    }
 
-  Future<void> initialize() async {
-    // Set up progress callbacks
-    DroidDeskPlatform.onDownloadProgress = (progress, status) {
-      _downloadProgress = progress;
-      _downloadStatus = status;
-      if (progress < 0) {
-        _isDownloading = false;
-        _errorMessage = status;
-      } else if (progress >= 1.0) {
-        _isDownloading = false;
-      }
-      notifyListeners();
-    };
-
-    DroidDeskPlatform.onExtractProgress = (progress, status) {
-      _extractProgress = progress;
-      _extractStatus = status;
-      if (progress < 0) {
-        _isExtracting = false;
-        _errorMessage = status;
-      } else if (progress >= 1.0) {
-        _isExtracting = false;
-        refreshStatus();
-      }
-      notifyListeners();
-    };
-
-    DroidDeskPlatform.onInstallProgress = (progress, status) {
-      // FIX: Ensure extractProgress looks "done" to the UI checklist 
-      _extractProgress = 1.0; 
-      _extractStatus = status;
-      _statusMessage = status;
-      _isInstallingDE = progress >= 0 && progress < 1.0;
-      
-      if (progress < 0) {
-        _isExtracting = false;
-        _isInstallingDE = false;
-        _errorMessage = status;
-      } else if (progress >= 1.0) {
-        _isExtracting = false;
-        _isInstallingDE = false;
-        refreshStatus();
-      }
-      notifyListeners();
-    };
-
-    DroidDeskPlatform.onTerminalOutput = (text) {
-      if (_terminalOutput.isEmpty) _terminalOutput.add('');
-
-      final cleanedText = text.replaceAll(RegExp(r'.*\r(?!\n)'), '');
-      if (_setupStep == 3) {
-        _setupLog += cleanedText;
-        if (_setupLog.length > 20000) {
-          _setupLog = _setupLog.substring(_setupLog.length - 20000);
+    fun extractRootfs(onProgress: (Double, String) -> Unit) {
+        rootfsManager.extractRootfs { progress, status ->
+            if (progress == 1.0) {
+                configureChrootRootfs()
+            }
+            onProgress(progress, status)
         }
-      }
-      if (_installingOptionalApp != null) {
-        _optionalInstallLog += cleanedText;
-        if (_optionalInstallLog.length > 20000) {
-          _optionalInstallLog = _optionalInstallLog.substring(
-            _optionalInstallLog.length - 20000,
-          );
-        }
-      }
-      final lines = cleanedText.split('\n');
+    }
 
-      for (int i = 0; i < lines.length; i++) {
-        if (i == 0) {
-          _terminalOutput[_terminalOutput.length - 1] += lines[i];
+    private fun writeRootFile(file: File, content: String) {
+        rootShell.exec("mkdir -p \"${file.parentFile?.absolutePath}\"")
+        rootShell.exec("cat << 'EOF' > \"${file.absolutePath}\"\n$content\nEOF")
+    }
+
+    private fun configureChrootRootfs() {
+        Log.i(TAG, "Applying chroot-specific rootfs configuration")
+        val path = rootfsDir.absolutePath
+
+        rootShell.exec("mkdir -p \"$path/etc/profile.d\" \"$path/etc/apt/apt.conf.d\"")
+
+        val haScript = """
+            export DISPLAY=:0
+            export XDG_RUNTIME_DIR=/tmp/runtime-root
+            export XDG_SESSION_TYPE=x11
+            export XDG_DATA_DIRS=/usr/share:/usr/local/share
+            export XDG_CONFIG_DIRS=/etc/xdg
+            export LIBGL_ALWAYS_SOFTWARE=true
+            export GALLIUM_DRIVER=llvmpipe
+            export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+            export NO_AT_BRIDGE=1
+            export GTK_A11Y=none
+            export LANG=C.UTF-8
+            export LC_ALL=C.UTF-8
+            export LANGUAGE=C.UTF-8
+            export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\\[\033[01;34m\]\w\[\033[00m\]\$ '
+        """.trimIndent()
+        writeRootFile(File(rootfsDir, "etc/profile.d/droiddesk-ha.sh"), haScript)
+
+        val sources = """
+            deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
+            deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
+            deb http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
+        """.trimIndent()
+        writeRootFile(File(rootfsDir, "etc/apt/sources.list"), sources)
+
+        val aptConf = """
+            Acquire::Retries "3";
+            Acquire::http::Timeout "30";
+            Acquire::https::Timeout "30";
+            DPkg::Lock::Timeout "60";
+        """.trimIndent()
+        writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-droiddesk-reliability"), aptConf)
+
+        Log.i(TAG, "Chroot rootfs configuration complete")
+    }
+
+    fun installDesktopEnvironment(
+        desktopEnv: String = "xfce4",
+        onProgress: (Double, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {}
+    ) {
+        if (!hasRoot() || !isRootfsReady()) {
+            onProgress(-1.0, "Root access required or Rootfs not ready")
+            return
+        }
+
+        thread(name = "chroot-de-install") {
+            try {
+                onProgress(0.0, "Configuring Ubuntu for Android...")
+                configureChrootRootfs()
+
+                onProgress(0.05, "Mounting virtual filesystems...")
+                ensureMounts()
+
+                onLog("Adding Android network groups to Linux...\n")
+                execChroot("groupadd -g 3003 inet || true", onLog)
+                execChroot("usermod -aG inet root || true", onLog)
+                execChroot("usermod -aG inet _apt || true", onLog)
+
+                onProgress(0.1, "Updating package lists...")
+                if (execChroot("apt-get -o APT::Sandbox::User=root update -y", onLog) != 0) {
+                    throw IllegalStateException("apt-get update failed. Check network connection.")
+                }
+
+                onProgress(0.2, "Installing core tools...")
+                if (execChroot(
+                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
+                            "locales ca-certificates wget curl dbus-x11",
+                    onLog
+                ) != 0) throw IllegalStateException("Core package installation failed")
+
+                onProgress(0.4, "Installing Mesa GPU drivers...")
+                execChroot(
+                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
+                            "mesa-vulkan-drivers mesa-opencl-icd libgl1-mesa-dri libglx-mesa0 vulkan-tools",
+                    onLog
+                )
+
+                onProgress(0.6, "Installing $desktopEnv...")
+                val dePackages = when (desktopEnv) {
+                    "lxqt" -> "lxqt qterminal pcmanfm-qt featherpad"
+                    "mate" -> "mate-desktop-environment mate-terminal"
+                    "kde" -> "plasma-desktop konsole dolphin"
+                    else -> "xfce4 xfce4-terminal xfce4-whiskermenu-plugin thunar mousepad"
+                }
+                if (execChroot(
+                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends $dePackages",
+                    onLog
+                ) != 0) throw IllegalStateException("Desktop package installation failed")
+
+                onProgress(0.8, "Installing Essentials...")
+                if (execChroot(
+                    "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
+                            "git nano htop wget curl python3 python3-pip openssh-client",
+                    onLog
+                ) != 0) throw IllegalStateException("Essentials installation failed")
+
+                onProgress(0.9, "Cleaning up...")
+                execChroot("apt-get clean", onLog)
+
+                File(baseDir, CHROOT_DE_MARKER).writeText(desktopEnv)
+
+                onProgress(1.0, "$desktopEnv installed in chroot")
+                Log.i(TAG, "Desktop environment installation complete")
+            } catch (e: Exception) {
+                Log.e(TAG, "DE install failed", e)
+                onProgress(-1.0, "Installation failed: ${e.message}")
+            }
+        }
+    }
+
+    fun installOptionalApp(appId: String, onProgress: (Double, String) -> Unit = { _, _ -> }, onLog: (String) -> Unit = {}): Boolean {
+        if (!hasRoot() || !isRootfsReady()) return false
+        
+        return try {
+            ensureMounts()
+            execChroot("dpkg --configure -a", onLog)
+            
+            val command = when (appId) {
+                "firefox" -> """
+                    set -e
+                    export DEBIAN_FRONTEND=noninteractive
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ca-certificates wget gpg
+                    install -d -m 0755 /etc/apt/keyrings
+                    wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /etc/apt/keyrings/packages.mozilla.org.asc
+                    echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' > /etc/apt/sources.list.d/mozilla.list
+                    printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' > /etc/apt/preferences.d/mozilla
+                    apt-get -o APT::Sandbox::User=root update -y
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends firefox
+                """.trimIndent()
+                "code_oss" -> """
+                    set -e
+                    export DEBIAN_FRONTEND=noninteractive
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ca-certificates wget gpg apt-transport-https
+                    install -d -m 0755 /etc/apt/keyrings
+                    wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/packages.microsoft.gpg
+                    echo 'deb [arch=arm64 signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main' > /etc/apt/sources.list.d/vscode.list
+                    apt-get -o APT::Sandbox::User=root update -y
+                    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends code
+                """.trimIndent()
+                "nodejs" -> "DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root update -y && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends nodejs npm"
+                "imagemagick" -> "DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root update -y && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends imagemagick"
+                else -> return false
+            }
+            
+            execChroot(command, onLog) == 0
+        } catch (e: Exception) {
+            Log.e(TAG, "Optional app install failed: $appId", e)
+            false
+        }
+    }
+
+    fun startSession(desktopEnv: String = "xfce4", width: Int = 1920, height: Int = 1080) {
+        if (!hasRoot() || !isRootfsReady() || isRunning()) return
+
+        val appUid = context.applicationInfo.uid
+        val rootStr = "${rootfsDir.absolutePath}/root"
+
+        // 1. Wipe stale locks from previous crashes that freeze the desktop
+        rootShell.exec("rm -rf \"$rootStr/.cache/sessions\" /tmp/.X11-unix/X0 /tmp/.X0-lock /tmp/dbus-* 2>/dev/null")
+        
+        // 2. Give Kotlin App User permission to write the Xfce Profile files
+        rootShell.exec("mkdir -p \"$rootStr\" && chown -R $appUid:$appUid \"$rootStr\"")
+
+        if (desktopEnv == "xfce4") {
+            XfceMobileProfile.install(
+                context = context,
+                homeDir = File(rootfsDir, "root"),
+                wallpaperFile = File(rootfsDir, "usr/share/backgrounds/droiddesk/ubuntu-touch.jpg"),
+                wallpaperPathInSession = "/usr/share/backgrounds/droiddesk/ubuntu-touch.jpg"
+            )
+        }
+
+        // 3. THE MAGIC FIX: Give everything back to Linux Root!
+        // XFCE Window Manager & DBus will crash if files are owned by the Android App.
+        rootShell.exec("chown -R 0:0 \"$rootStr\" && chmod -R 755 \"$rootStr\"")
+
+        ensureMounts()
+        bindX11Socket()
+
+        val deBin = when (desktopEnv) {
+            "lxqt" -> "lxqt-session"
+            "mate" -> "mate-session"
+            "kde" -> "startplasma-x11"
+            "xfce4" -> "startxfce4"
+            else -> desktopEnv
+        }
+
+        // Cleaned up DBus launch sequence to prevent conflicting processes
+        val runScript = """
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            export TMPDIR=/tmp
+            export TEMP=/tmp
+            export TMP=/tmp
+            export HOME=/root
+            export USER=root
+            export LOGNAME=root
+            export LD_PRELOAD=/usr/local/lib/libclose_range_hack.so
+            . /etc/profile.d/droiddesk-ha.sh 2>/dev/null || true
+            mkdir -p /tmp/.X11-unix
+            
+            # Start desktop with its own dedicated DBus session
+            exec dbus-run-session -- $deBin
+        """.trimIndent()
+
+        val su = rootShell.findSuPath() ?: return
+        val fullCommand = "chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(runScript)}"
+        
+        sessionProcess = ProcessBuilder(su, "-c", fullCommand).redirectErrorStream(true).start()
+
+        Thread {
+            try {
+                val reader = sessionProcess!!.inputStream.bufferedReader()
+                val buffer = CharArray(1024)
+                var charsRead: Int
+                while (reader.read(buffer).also { charsRead = it } != -1) {
+                    Log.d(TAG, "CHROOT: " + String(buffer, 0, charsRead))
+                }
+            } catch (e: Exception) {}
+        }.start()
+    }
+
+    fun stopSession() {
+        sessionProcess?.destroyForcibly()
+        sessionProcess = null
+        
+        // Force-kill all ghost UI processes to ensure a clean launch next time
+        rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c 'killall -9 xfce4-session xfwm4 xfdesktop xfce4-panel dbus-daemon lxqt-session startplasma-x11 kwin_x11 2>/dev/null'")
+        
+        unmountAll()
+    }
+
+    fun ensureMounts() {
+        if (!hasRoot()) return
+        val mounts = rootShell.exec("mount").lines()
+        fun isMounted(path: String): Boolean = mounts.any { it.contains(" on ${File(rootfsDir, path).absolutePath} ") }
+
+        fun mountIfNeeded(relative: String, mountArgs: String) {
+            if (isMounted(relative)) return
+            val target = File(rootfsDir, relative).absolutePath
+            rootShell.exec("mkdir -p $target && mount $mountArgs $target")
+        }
+
+        mountIfNeeded("/dev", "--bind /dev")
+        mountIfNeeded("/dev/pts", "--bind /dev/pts")
+        mountIfNeeded("/dev/shm", "-t tmpfs tmpfs")
+        mountIfNeeded("/proc", "--bind /proc")
+        mountIfNeeded("/sys", "--bind /sys")
+        mountIfNeeded("/run", "-t tmpfs tmpfs")
+        mountIfNeeded("/tmp", "-t tmpfs tmpfs")
+        execChroot("mkdir -p /tmp/.X11-unix /tmp/runtime-root /root")
+    }
+
+    fun bindX11Socket() {
+        if (!hasRoot()) return
+        x11HostDir.mkdirs()
+        val chrootX11 = File(rootfsDir, "tmp/.X11-unix").absolutePath
+        val hostX11 = x11HostDir.absolutePath
+        if (!rootShell.exec("mount").contains(" on $chrootX11 ")) {
+            rootShell.exec("mkdir -p $chrootX11 && mount --bind $hostX11 $chrootX11")
+        }
+    }
+
+    fun unmountAll() {
+        if (!hasRoot()) return
+        val mounts = rootShell.exec("mount").lines()
+        listOf("tmp/.X11-unix", "dev/pts", "dev/shm", "dev", "proc", "sys", "run", "tmp").forEach {
+            val target = File(rootfsDir, it).absolutePath
+            if (mounts.any { m -> m.contains(" on $target ") }) {
+                rootShell.exec("umount -l $target 2>/dev/null || umount $target 2>/dev/null")
+            }
+        }
+    }
+
+    fun executeCommand(command: String, onOutput: ((String) -> Unit)? = null): String {
+        if (!hasRoot()) return "Error: root access required"
+        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export TMPDIR=/tmp; export HOME=/root; $command"
+        return if (onOutput != null) {
+            "Exit code: " + rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}", onOutput)
         } else {
-          _terminalOutput.add(lines[i]);
+            rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}")
         }
-      }
-      notifyListeners();
-    };
-
-    DroidDeskPlatform.onOptionalInstallProgress = (progress, status) {
-      _optionalInstallProgress = progress.clamp(0.0, 1.0);
-      _optionalInstallStatus = status;
-      notifyListeners();
-    };
-
-    await refreshStatus();
-    await loadDeviceInfo();
-  }
-
-  Future<void> refreshStatus() async {
-    try {
-      final status = await DroidDeskPlatform.getRuntimeStatus();
-      _isBootstrapped = status['isBootstrapped'] == true;
-      _isRunning = status['isRunning'] == true;
-      _hasRoot = status['hasRoot'] == true;
-      _installedDistro = status['distro']?.toString() ?? '';
-      _installedDE = status['installedDE']?.toString() ?? '';
-
-      if (_installedDE.isNotEmpty) {
-        await refreshOptionalApps();
-      }
-
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Failed to get runtime status: $e';
-      notifyListeners();
-    }
-  }
-
-  Future<void> loadDeviceInfo() async {
-    try {
-      _deviceInfo = await DroidDeskPlatform.getDeviceInfo();
-      notifyListeners();
-    } catch (e) {
-      // Non-fatal — continue without device info
-    }
-  }
-
-  // ── Setup Flow ──
-
-  void setSelectedDistro(String distro) {
-    _selectedDistro = distro;
-    notifyListeners();
-  }
-
-  void setSelectedDE(String de) {
-    _selectedDE = de;
-    notifyListeners();
-  }
-
-  void setSetupStep(int step) {
-    _setupStep = step;
-    _errorMessage = null;
-    notifyListeners();
-  }
-
-  Future<bool> detectRootForSetup() async {
-    _hasRoot = await DroidDeskPlatform.checkRoot();
-    notifyListeners();
-    return _hasRoot;
-  }
-
-  Future<void> runSetup({bool? useRoot}) async {
-    try {
-      _errorMessage = null;
-      _setupLog = '';
-      _setupStep = 3;
-      notifyListeners();
-
-      final rootAvailable = await DroidDeskPlatform.checkRoot();
-      _hasRoot = rootAvailable && (useRoot ?? true);
-      notifyListeners();
-
-      if (_hasRoot) {
-        await _runChrootSetup();
-      } else {
-        await _runNativeSetup();
-      }
-
-      _setupStep = 4;
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Setup failed: $e';
-      _isDownloading = false;
-      _isExtracting = false;
-      _isInstallingDE = false;
-      notifyListeners();
-    }
-  }
-
-  Future<void> _runNativeSetup() async {
-    _isExtracting = true;
-    _extractProgress = 0.0;
-    _extractStatus = 'Extracting native Termux bootstrap...';
-    _statusMessage = _extractStatus;
-    notifyListeners();
-    await DroidDeskPlatform.setupBootstrap();
-
-    _extractProgress = 0.08;
-    _extractStatus = 'Bootstrap environment ready';
-    _statusMessage = _extractStatus;
-    _isInstallingDE = true;
-    notifyListeners();
-    final installed = await DroidDeskPlatform.installDesktopNative(
-      de: _selectedDE,
-    );
-    if (!installed) {
-      throw StateError('Native Termux package installation failed');
-    }
-    _isExtracting = false;
-    _isInstallingDE = false;
-
-    await refreshStatus();
-  }
-
-  Future<void> _runChrootSetup() async {
-    _statusMessage = 'Downloading Ubuntu rootfs...';
-    _isDownloading = true;
-    _downloadProgress = 0.0;
-    notifyListeners();
-    if (!await DroidDeskPlatform.downloadRootfs(_selectedDistro)) {
-      throw StateError(
-        'Ubuntu download failed. Check your connection and retry.',
-      );
     }
 
-    _isDownloading = false;
-    _isExtracting = true;
-    _extractProgress = 0.0;
-    _statusMessage = 'Extracting rootfs...';
-    notifyListeners();
-    if (!await DroidDeskPlatform.extractRootfs()) {
-      throw StateError('Ubuntu filesystem extraction failed');
+    private fun execChroot(command: String, onLog: (String) -> Unit = {}): Int {
+        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export TMPDIR=/tmp; export TEMP=/tmp; export TMP=/tmp; export HOME=/root; $command"
+        return rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}", onLog)
     }
 
-    _statusMessage =
-        'Installing desktop environment (this may take a while)...';
-    _isInstallingDE = true;
-    notifyListeners();
-    if (!await DroidDeskPlatform.installDesktopEnvironment(_selectedDE)) {
-      throw StateError('Desktop Essentials package installation failed');
-    }
-    _isExtracting = false;
-    _isInstallingDE = false;
-
-    await refreshStatus();
-  }
-
-  Future<void> runExtraction() async {
-    _extractProgress = 1.0;
-    _extractStatus = 'Extraction handled by setup flow';
-    notifyListeners();
-  }
-
-  Future<void> installDesktopEnvironment() async {
-    try {
-      _isExtracting = true;
-      _extractProgress = 1.0;
-      _statusMessage = 'Installing Desktop Environment...';
-      _errorMessage = null;
-      notifyListeners();
-
-      if (_hasRoot) {
-        if (!await DroidDeskPlatform.installDesktopEnvironment(_selectedDE)) {
-          throw StateError('Desktop Essentials package installation failed');
-        }
-      } else {
-        final installed = await DroidDeskPlatform.installDesktopNative(
-          de: _selectedDE,
-        );
-        if (!installed) {
-          throw StateError('Native Termux package installation failed');
-        }
-      }
-
-      _isExtracting = false;
-      _isInstallingDE = false;
-      await refreshStatus();
-    } catch (e) {
-      _errorMessage = 'Installation failed: $e';
-      _isExtracting = false;
-      _isInstallingDE = false;
-      notifyListeners();
-    }
-  }
-
-  // ── Optional applications ──
-
-  Future<void> refreshOptionalApps() async {
-    try {
-      _optionalApps = await DroidDeskPlatform.getOptionalApps();
-      notifyListeners();
-    } catch (_) {
-    }
-  }
-
-  Future<bool> installOptionalApp(String appId) async {
-    if (_installingOptionalApp != null) return false;
-    _installingOptionalApp = appId;
-    _optionalInstallProgress = 0.0;
-    _optionalInstallStatus = 'Preparing installation...';
-    _optionalInstallLog = '';
-    notifyListeners();
-
-    try {
-      final installed = await DroidDeskPlatform.installOptionalApp(appId);
-      await refreshOptionalApps();
-      return installed;
-    } finally {
-      _installingOptionalApp = null;
-      notifyListeners();
-    }
-  }
-
-  // ── Session Control ──
-
-  Future<void> startLinux({
-    String mode = 'x11',
-    int width = 1920,
-    int height = 1080,
-  }) async {
-    try {
-      _errorMessage = null;
-      final started = await DroidDeskPlatform.startLinux(
-        de: _selectedDE,
-        mode: mode,
-        width: width,
-        height: height,
-      );
-      if (!started) {
-        throw StateError('Linux runtime is not ready');
-      }
-      _isRunning = true;
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Failed to start: $e';
-      notifyListeners();
-    }
-  }
-
-  Future<void> launchDesktopActivity() async {
-    try {
-      await DroidDeskPlatform.launchDesktopActivity();
-    } catch (e) {
-      _errorMessage = 'Failed to launch desktop activity: $e';
-      notifyListeners();
-    }
-  }
-
-  Future<void> stopLinux() async {
-    try {
-      await DroidDeskPlatform.stopLinux();
-      _isRunning = false;
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Failed to stop: $e';
-      notifyListeners();
-    }
-  }
-
-  Future<String> executeCommand(String command) async {
-    try {
-      _terminalOutput.add('\$ $command\n');
-      notifyListeners();
-      return await DroidDeskPlatform.executeCommand(command);
-    } catch (e) {
-      return "Error executing command: $e";
-    }
-  }
-
-  void useNativeTerminal() {
-    _isProotTerminal = false;
-    notifyListeners();
-  }
-
-  Future<void> startDebianShell() async {
-    _isProotTerminal = true;
-    clearTerminal();
-    await executeCommand('start-debian');
-  }
-
-  void appendTerminalOutput(String output) {
-    if (_terminalOutput.isEmpty) _terminalOutput.add('');
-    _terminalOutput[_terminalOutput.length - 1] += output;
-    notifyListeners();
-  }
-
-  void clearTerminal() {
-    _terminalOutput.clear();
-    _terminalOutput.add('DroidDesk Linux Terminal\nType commands below.\n');
-    notifyListeners();
-  }
-
-  Future<void> interruptCommand() async {
-    try {
-      await DroidDeskPlatform.interruptCommand();
-    } catch (e) {
-      debugPrint("Error interrupting command: $e");
-    }
-  }
-
-  void clearError() {
-    _errorMessage = null;
-    notifyListeners();
-  }
+    private fun shellQuote(input: String): String = "'" + input.replace("'", "'\"'\"'") + "'"
 }
