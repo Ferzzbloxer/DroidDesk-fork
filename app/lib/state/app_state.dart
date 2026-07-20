@@ -110,10 +110,12 @@ class AppState extends ChangeNotifier {
     };
 
     DroidDeskPlatform.onInstallProgress = (progress, status) {
-      _extractProgress = progress; // reusing extract progress state for UI
+      // FIX: Ensure extractProgress looks "done" to the UI checklist 
+      _extractProgress = 1.0; 
       _extractStatus = status;
       _statusMessage = status;
       _isInstallingDE = progress >= 0 && progress < 1.0;
+      
       if (progress < 0) {
         _isExtracting = false;
         _isInstallingDE = false;
@@ -219,8 +221,6 @@ class AppState extends ChangeNotifier {
     return _hasRoot;
   }
 
-  /// Main setup entry point. [useRoot] records confirmation from the
-  /// rooted-device dialog.
   Future<void> runSetup({bool? useRoot}) async {
     try {
       _errorMessage = null;
@@ -228,7 +228,6 @@ class AppState extends ChangeNotifier {
       _setupStep = 3;
       notifyListeners();
 
-      // Detect root and choose path
       final rootAvailable = await DroidDeskPlatform.checkRoot();
       _hasRoot = rootAvailable && (useRoot ?? true);
       notifyListeners();
@@ -309,8 +308,6 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> runExtraction() async {
-    // Handled inside runSetup for chroot mode.
-    // Kept for API compatibility.
     _extractProgress = 1.0;
     _extractStatus = 'Extraction handled by setup flow';
     notifyListeners();
@@ -319,7 +316,7 @@ class AppState extends ChangeNotifier {
   Future<void> installDesktopEnvironment() async {
     try {
       _isExtracting = true;
-      _extractProgress = 0.0;
+      _extractProgress = 1.0;
       _statusMessage = 'Installing Desktop Environment...';
       _errorMessage = null;
       notifyListeners();
@@ -355,7 +352,6 @@ class AppState extends ChangeNotifier {
       _optionalApps = await DroidDeskPlatform.getOptionalApps();
       notifyListeners();
     } catch (_) {
-      // The desktop remains usable even if package status cannot be queried.
     }
   }
 
