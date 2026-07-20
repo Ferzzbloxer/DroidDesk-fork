@@ -36,19 +36,28 @@ class RootfsManager(private val context: Context) {
     fun getInstalledDistro(): String = if (configFile.exists()) configFile.readText().trim() else ""
     fun getInstalledDE(): String = if (deConfigFile.exists()) deConfigFile.readText().trim() else ""
     fun getRootfsPath(): String = rootfsDir.absolutePath
-    
-    // We use the Root Shell to calculate size since the app can't see the files
     fun getRootfsSizeMB(): Long = if (isRootfsReady()) 350L else 0L
 
-    // THE FIX: We only check the marker file created by the app
+    // FIX: Ask the Root Shell to verify files, bypassing Android Java File permission blocks
     fun isRootfsReady(): Boolean {
-        return File(baseDir, "SETUP_COMPLETE").exists()
+        val rootShell = RootShell(context)
+        val result = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/bin/bash\" ] && [ -d \"${rootfsDir.absolutePath}/etc\" ]; then echo 1; else echo 0; fi").trim()
+        return result == "1"
     }
 
     fun getMissingPackages(): List<String> {
         if (!isRootfsReady()) return listOf("rootfs")
         val de = getInstalledDE().ifEmpty { "xfce4" }
-        return if (File(baseDir, ".chroot_de_installed").exists()) emptyList() else listOf(de)
+        val rootShell = RootShell(context)
+        val binExists = rootShell.exec("if [ -f \"${rootfsDir.absolutePath}/usr/bin/startxfce4\" ]; then echo 1; else echo 0; fi").trim() == "1"
+        return if (binExists) emptyList() else listOf(de)
+    }
+
+    // Helper to write files inside root-owned folders safely
+    private fun writeRootFile(file: File, content: String) {
+        val rootShell = RootShell(context)
+        rootShell.exec("mkdir -p \"${file.parentFile?.absolutePath}\"")
+        rootShell.exec("cat << 'EOF' > \"${file.absolutePath}\"\n$content\nEOF")
     }
 
     fun downloadRootfs(distro: String, onProgress: (Double, String) -> Unit) {
@@ -107,25 +116,26 @@ class RootfsManager(private val context: Context) {
 
                 val rootShell = RootShell(context)
                 onProgress(0.1, "Preparing extraction...")
-                
-                // Clear the old marker
-                File(baseDir, "SETUP_COMPLETE").delete()
-                
                 rootShell.exec("rm -rf \"${rootfsDir.absolutePath}\" && mkdir -p \"${rootfsDir.absolutePath}\"")
 
-                onProgress(0.2, "Extracting Linux Filesystem...")
                 val ext = if (distro == "kali") "xz" else "gz"
+                val tarFlags = if (ext == "xz") "Jxf" else "zxf"
                 
-                // THE FIX: The 'pipe' method completely bypasses Android's symlink security 
-                val cmd = if (ext == "xz") {
-                    "sh -c \"xz -dc '${tarball.absolutePath}' | (cd '${rootfsDir.absolutePath}' && tar -x -p -P --no-same-owner)\""
-                } else {
-                    "sh -c \"zcat '${tarball.absolutePath}' | (cd '${rootfsDir.absolutePath}' && tar -x -p -P --no-same-owner)\""
-                }
+                onProgress(0.2, "Extracting Linux Filesystem...")
                 
-                rootShell.exec(cmd)
+                // Stream-extraction bypassing Android Toybox limitations on absolute symlinks
+                val extractCmd = """
+                    cd "${rootfsDir.absolutePath}" && 
+                    if echo "${tarball.absolutePath}" | grep -q ".xz"; then 
+                        xz -dc "${tarball.absolutePath}" | tar -x -p -P --no-same-owner 2>/dev/null; 
+                    else 
+                        zcat "${tarball.absolutePath}" | tar -x -p -P --no-same-owner 2>/dev/null; 
+                    fi
+                """.trimIndent().replace("\n", " ")
+                
+                rootShell.exec(extractCmd)
 
-                // Verify success via Root Check
+                // Verify success via Root
                 val checkCmd = "if [ -f \"${rootfsDir.absolutePath}/bin/bash\" ]; then echo SUCCESS; else echo FAIL; fi"
                 val result = rootShell.exec(checkCmd)
                 if (!result.contains("SUCCESS")) {
@@ -135,8 +145,7 @@ class RootfsManager(private val context: Context) {
                 onProgress(0.7, "Configuring Linux environment...")
                 configureRootfs()
                 
-                // THE FIX: Set the marker that the app user can safely see
-                File(baseDir, "SETUP_COMPLETE").writeText("done")
+                File(context.filesDir, "SETUP_COMPLETE").writeText("done")
                 tarball.delete()
                 
                 onProgress(1.0, "${DISTRO_NAMES[distro] ?: distro} setup complete")
@@ -149,21 +158,40 @@ class RootfsManager(private val context: Context) {
     }
 
     private fun configureRootfs() {
-        val rootShell = RootShell(context)
         val path = rootfsDir.absolutePath
 
-        rootShell.exec("mkdir -p \"$path/etc/apt/apt.conf.d\"")
-        rootShell.exec("echo 'APT::Sandbox::User \"root\";' > \"$path/etc/apt/apt.conf.d/99-disable-sandbox\"")
-        rootShell.exec("echo 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > \"$path/etc/resolv.conf\"")
-        rootShell.exec("echo 'droiddesk' > \"$path/etc/hostname\"")
-        rootShell.exec("echo '127.0.0.1 localhost\n127.0.0.1 droiddesk\n::1 localhost' > \"$path/etc/hosts\"")
+        // We write the config files as root to avoid Kotlin Permission Denied issues
+        writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-disable-sandbox"), "APT::Sandbox::User \"root\";\n")
+        writeRootFile(File(rootfsDir, "etc/resolv.conf"), "nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+        writeRootFile(File(rootfsDir, "etc/hostname"), "droiddesk\n")
+        writeRootFile(File(rootfsDir, "etc/hosts"), "127.0.0.1 localhost\n127.0.0.1 droiddesk\n::1 localhost ip6-localhost ip6-loopback\n")
         
-        rootShell.exec("mkdir -p \"$path/etc/profile.d\"")
-        rootShell.exec("echo 'export DISPLAY=:0\nexport PULSE_SERVER=127.0.0.1\nexport XDG_RUNTIME_DIR=/tmp/runtime-root\nmkdir -p /tmp/runtime-root 2>/dev/null\nexport PS1=\"\\[\\033[01;32m\\]droiddesk\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ \"' > \"$path/etc/profile.d/droiddesk.sh\"")
-        
-        rootShell.exec("mkdir -p \"$path/etc/sudoers.d\"")
-        rootShell.exec("echo 'Defaults !requiretty\nroot ALL=(ALL) NOPASSWD: ALL' > \"$path/etc/sudoers.d/droiddesk\"")
-        
+        val droiddeskProfile = """
+            #!/bin/bash
+            export DISPLAY=:0
+            export PULSE_SERVER=127.0.0.1
+            export MESA_NO_ERROR=1
+            export MESA_GL_VERSION_OVERRIDE=4.6
+            export MESA_GLES_VERSION_OVERRIDE=3.2
+            export GALLIUM_DRIVER=zink
+            export MESA_LOADER_DRIVER_OVERRIDE=zink
+            export TU_DEBUG=noconform
+            export ZINK_DESCRIPTORS=lazy
+            export MESA_VK_WSI_PRESENT_MODE=immediate
+            export XDG_RUNTIME_DIR=/tmp/runtime-root
+            mkdir -p "${'$'}XDG_RUNTIME_DIR" 2>/dev/null
+            export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+            alias ll='ls -la --color=auto'
+            alias update='apt update && apt upgrade -y'
+        """.trimIndent()
+        writeRootFile(File(rootfsDir, "etc/profile.d/droiddesk.sh"), droiddeskProfile)
+        writeRootFile(File(rootfsDir, "etc/sudoers.d/droiddesk"), "Defaults !requiretty\nroot ALL=(ALL) NOPASSWD: ALL\n")
+
+        val rootShell = RootShell(context)
         rootShell.exec("mkdir -p \"$path/tmp\" \"$path/run\" \"$path/proc\" \"$path/sys\" \"$path/dev/pts\" \"$path/dev/shm\"")
+    }
+
+    private fun calculateDirSize(dir: File): Long {
+        return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
     }
 }
