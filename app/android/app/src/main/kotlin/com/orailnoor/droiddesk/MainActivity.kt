@@ -485,15 +485,48 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun getGpuVendor(): String {
+    // Helper function to cleanly read Android properties
+    private fun getSystemProperty(propName: String): String {
         return try {
-            val prop = Runtime.getRuntime().exec(arrayOf("getprop", "ro.hardware.egl"))
-            val result = prop.inputStream.bufferedReader().readText().trim()
-            prop.waitFor()
-            if (result.isNotEmpty()) result else "unknown"
+            val process = Runtime.getRuntime().exec(arrayOf("getprop", propName))
+            val result = process.inputStream.bufferedReader().readText().trim()
+            process.waitFor()
+            result
         } catch (e: Exception) {
-            "unknown"
+            ""
         }
+    }
+
+    private fun getGpuVendor(): String {
+        try {
+            // 1. Most Reliable: Check actual hardware device nodes in the Linux kernel
+            if (File("/dev/mali0").exists()) return "Mali (MediaTek/Exynos)"
+            if (File("/dev/kgsl-3d0").exists()) return "Adreno (Snapdragon)"
+
+            // 2. Secondary: Check Android system properties
+            val egl = getSystemProperty("ro.hardware.egl").lowercase()
+            val vulkan = getSystemProperty("ro.hardware.vulkan").lowercase()
+            val platform = getSystemProperty("ro.board.platform").lowercase()
+            val hardware = getSystemProperty("ro.hardware").lowercase()
+
+            // 3. Match explicit GPU properties
+            if (egl.contains("mali") || vulkan.contains("mali")) return "Mali"
+            if (egl.contains("adreno") || vulkan.contains("adreno")) return "Adreno"
+            if (egl.contains("powervr") || vulkan.contains("powervr")) return "PowerVR"
+
+            // 4. Infer GPU from the CPU / SoC family (MediaTek CPUs always use Mali or PowerVR)
+            if (platform.startsWith("mt") || hardware.startsWith("mt")) return "Mali (MediaTek)"
+            if (platform.startsWith("exynos") || hardware.startsWith("exynos")) return "Mali (Exynos)"
+            if (platform.startsWith("sm") || platform.startsWith("msm") || platform.startsWith("sdm")) return "Adreno (Snapdragon)"
+            if (platform.startsWith("tensor") || platform.startsWith("gs")) return "Mali (Google Tensor)"
+
+            // 5. Fallback
+            if (egl.isNotBlank()) return "Unknown ($egl)"
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Hardware detection failed", e)
+        }
+        return "Unknown GPU"
     }
 
     private fun getTotalRam(): Long {
