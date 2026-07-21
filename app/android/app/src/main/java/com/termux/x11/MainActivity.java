@@ -64,7 +64,15 @@ public class MainActivity extends Activity {
     public void toggleExtraKeys() {}
     public void toggleMouseHelper() {}
     
-    public static void setCapturingEnabled(boolean e) {}
+    // ADDED FOR RAW MOUSE SUPPORT: Releases mouse back to Android
+    public static void setCapturingEnabled(boolean e) {
+        if (!e && instance != null && instance.lorieView != null) {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                instance.lorieView.releasePointerCapture();
+            }
+        }
+    }
+    
     public void setExternalKeyboardConnected(boolean c) {}
     
     public static void getRealMetrics(DisplayMetrics metrics) {
@@ -100,7 +108,6 @@ public class MainActivity extends Activity {
         android.util.Log.e("MainActivity", "clientConnectedStateChanged called by native code!");
         if (lorieView != null) {
             handler.postDelayed(() -> {
-                android.util.Log.e("MainActivity", "Executing triggerCallback from MainActivity handler!");
                 lorieView.triggerCallback();
             }, 200);
             handler.postDelayed(() -> lorieView.triggerCallback(), 500);
