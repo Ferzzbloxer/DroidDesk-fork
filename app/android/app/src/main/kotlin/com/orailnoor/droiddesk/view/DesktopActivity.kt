@@ -62,8 +62,6 @@ class DesktopActivity : Activity() {
         placeholder = FrameLayout(this)
         placeholder.setBackgroundColor(Color.BLACK)
         setContentView(placeholder)
-        // Some Android/LineageOS builds throw from PhoneWindow.getInsetsController
-        // until a decor view has been created by setContentView().
         enableImmersiveMode()
 
         Log.i(TAG, "DesktopActivity created mode=$sessionMode startSession=$shouldStartSession")
@@ -121,7 +119,6 @@ class DesktopActivity : Activity() {
         TermuxMainActivity.getInstance().initLorieView(this)
         lorieView = TermuxMainActivity.getInstance().lorieView
 
-        // Keep Android overlay controls above the X11 SurfaceView.
         lorieView!!.setZOrderOnTop(false)
         placeholder.setBackgroundColor(Color.BLACK)
 
@@ -129,14 +126,10 @@ class DesktopActivity : Activity() {
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         )
-        // TermuxMainActivity retains its LorieView singleton across activity
-        // recreation. Detach it from the previous activity's container before
-        // attaching it here, otherwise Android throws "child already has a parent".
         (lorieView!!.parent as? ViewGroup)?.removeView(lorieView)
         placeholder.addView(lorieView, params)
         Log.i(TAG, "LorieView added to placeholder")
 
-        // Start X server only after the Surface is actually created/changed.
         surfaceCallback = object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 Log.i(TAG, "LorieView surfaceCreated")
@@ -222,6 +215,18 @@ class DesktopActivity : Activity() {
                 Toast.makeText(this@DesktopActivity, "Input mode: $text", Toast.LENGTH_SHORT).show()
             }
         }
+        
+        // ADDED FOR RAW MOUSE SUPPORT: Button to lock mouse for games/3D
+        val captureButton = controlButton("Lock Mouse").apply {
+            setOnClickListener {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    lorieView?.requestPointerCapture()
+                    setControlsCollapsed(true) 
+                    Toast.makeText(this@DesktopActivity, "Mouse locked! Press ESC to unlock.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+
         val hideButton = controlButton("−").apply {
             contentDescription = "Hide desktop controls"
             setOnClickListener { setControlsCollapsed(true) }
@@ -231,24 +236,15 @@ class DesktopActivity : Activity() {
         controlOverlay = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(dragHandle, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
-            ))
-            addView(keyboardButton, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
-            ))
-            addView(inputModeButton, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
-            ))
-            addView(hideButton, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt(),
-            ))
+            addView(dragHandle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt()))
+            addView(keyboardButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt()))
+            addView(inputModeButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt()))
+            addView(captureButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt()))
+            addView(hideButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, (42 * density).toInt()))
         }
 
         collapsedControl = controlButton("☰").apply {
             contentDescription = "Show desktop controls"
-            // Keep this measured so switching from a dragged full overlay can
-            // copy absolute coordinates without placing the restore handle off-screen.
             visibility = View.INVISIBLE
         }
 
