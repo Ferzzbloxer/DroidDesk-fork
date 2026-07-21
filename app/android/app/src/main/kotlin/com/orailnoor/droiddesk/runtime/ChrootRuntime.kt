@@ -261,6 +261,10 @@ class ChrootRuntime(private val context: Context) {
         // 1. Wipe stale locks from previous crashes that freeze the desktop
         rootShell.exec("rm -rf \"$rootStr/.cache/sessions\" /tmp/.X11-unix/X0 /tmp/.X0-lock /tmp/dbus-* 2>/dev/null")
         
+        // THE NETWORK FIX: Destroy any broken symlinks created by Ubuntu updates and force static DNS
+        rootShell.exec("rm -f \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
+        rootShell.exec("echo 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
+
         // 2. Give Kotlin App User permission to write the Xfce Profile files
         rootShell.exec("mkdir -p \"$rootStr\" && chown -R $appUid:$appUid \"$rootStr\"")
 
