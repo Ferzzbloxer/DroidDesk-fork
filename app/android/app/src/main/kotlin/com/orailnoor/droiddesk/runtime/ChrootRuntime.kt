@@ -105,7 +105,7 @@ class ChrootRuntime(private val context: Context) {
         """.trimIndent()
         writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-droiddesk-reliability"), aptConf)
 
-        // --- NEW: VNC USB Auto-Listener Script ---
+        // --- VNC USB Auto-Listener Script ---
         val vncListenerScript = """
             #!/bin/bash
             USB_STATE_FILE="/sys/class/android_usb/android0/state"
@@ -188,7 +188,6 @@ class ChrootRuntime(private val context: Context) {
                 ) != 0) throw IllegalStateException("Desktop package installation failed")
 
                 onProgress(0.8, "Installing Essentials...")
-                // We added x11vnc to the end of this list!
                 if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
                             "git nano htop wget curl python3 python3-pip openssh-client x11vnc",
@@ -256,14 +255,14 @@ class ChrootRuntime(private val context: Context) {
         val appUid = context.applicationInfo.uid
         val rootStr = "${rootfsDir.absolutePath}/root"
 
-        // 1. Wipe stale locks
+        // Wipe stale locks
         rootShell.exec("rm -rf \"$rootStr/.cache/sessions\" /tmp/.X11-unix/X0 /tmp/.X0-lock /tmp/dbus-* 2>/dev/null")
         
-        // 2. Network DNS fix
+        // Network DNS fix
         rootShell.exec("rm -f \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
         rootShell.exec("echo 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
         
-        // 3. Temporarily give app write permissions for config creation
+        // Temporarily give app write permissions for config creation
         rootShell.exec("mkdir -p \"$rootStr\" && chown -R $appUid:$appUid \"$rootStr\"")
 
         if (desktopEnv == "xfce4") {
@@ -275,7 +274,7 @@ class ChrootRuntime(private val context: Context) {
             )
         }
 
-        // 4. Give ownership back to root so the Window Manager works securely
+        // Give ownership back to root so the Window Manager works securely
         rootShell.exec("chown -R 0:0 \"$rootStr\" && chmod -R 750 \"$rootStr\"")
 
         ensureMounts()
@@ -297,7 +296,6 @@ class ChrootRuntime(private val context: Context) {
             export HOME=/root
             export USER=root
             export LOGNAME=root
-            export LD_PRELOAD=/usr/local/lib/libclose_range_hack.so
             . /etc/profile.d/droiddesk-ha.sh 2>/dev/null || true
             export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session
             rm -f /tmp/dbus-session
