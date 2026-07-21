@@ -70,7 +70,7 @@ class ChrootRuntime(private val context: Context) {
         Log.i(TAG, "Applying chroot-specific rootfs configuration")
         val path = rootfsDir.absolutePath
 
-        rootShell.exec("mkdir -p \"$path/etc/profile.d\" \"$path/etc/apt/apt.conf.d\"")
+        rootShell.exec("mkdir -p \"$path/etc/profile.d\" \"$path/etc/apt/apt.conf.d\" \"$path/usr/local/bin\"")
 
         val haScript = """
             export DISPLAY=:0
@@ -89,6 +89,34 @@ class ChrootRuntime(private val context: Context) {
             export PS1='\[\033[01;32m\]droiddesk\[\033[00m\]:\\[\033[01;34m\]\w\[\033[00m\]\$ '
         """.trimIndent()
         writeRootFile(File(rootfsDir, "etc/profile.d/droiddesk-ha.sh"), haScript)
+
+        // --- NEW GLOBAL AUTO-PATCHER SCRIPT ---
+        val autoPatcherScript = """
+            #!/bin/bash
+            APPS=("code" "code-oss" "google-chrome" "google-chrome-stable" "chromium" "chromium-browser" "discord" "brave-browser" "microsoft-edge" "microsoft-edge-stable" "obsidian" "cursor" "github-desktop" "postman" "slack" "teams")
+            for app in "${'$'}{APPS[@]}"; do
+                BIN_PATH=${'$'}(which "${'$'}app" 2>/dev/null)
+                if [ -n "${'$'}BIN_PATH" ] && [ ! -f "${'$'}BIN_PATH.real" ]; then
+                    mv "${'$'}BIN_PATH" "${'$'}BIN_PATH.real"
+                    if [[ "${'$'}app" == *"code"* || "${'$'}app" == *"cursor"* ]]; then
+                        echo -e '#!/bin/bash\nexec "'"${'$'}BIN_PATH"'.real" --no-sandbox --user-data-dir=/root/.config/app-data "${'$'}@"' > "${'$'}BIN_PATH"
+                    else
+                        echo -e '#!/bin/bash\nexec "'"${'$'}BIN_PATH"'.real" --no-sandbox "${'$'}@"' > "${'$'}BIN_PATH"
+                    fi
+                    chmod +x "${'$'}BIN_PATH"
+                fi
+            done
+            VLC_PATH=${'$'}(which vlc 2>/dev/null)
+            if [ -n "${'$'}VLC_PATH" ] && grep -q "geteuid" "${'$'}VLC_PATH"; then
+                sed -i 's/geteuid/getppid/g' "${'$'}VLC_PATH"
+            fi
+        """.trimIndent()
+        writeRootFile(File(rootfsDir, "usr/local/bin/patch-root-binaries.sh"), autoPatcherScript)
+        rootShell.exec("chmod +x \"$path/usr/local/bin/patch-root-binaries.sh\"")
+
+        // Hook it into APT
+        writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-autopatch"), "DPkg::Post-Invoke { \"/usr/local/bin/patch-root-binaries.sh\"; };\n")
+        // --------------------------------------
 
         val sources = """
             deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
