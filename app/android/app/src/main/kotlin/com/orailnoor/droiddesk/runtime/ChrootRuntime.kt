@@ -190,7 +190,7 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.8, "Installing Essentials...")
                 if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
-                            "git nano htop wget curl python3 python3-pip openssh-client x11vnc",
+                            "libgl1 git nano htop wget curl python3 python3-pip openssh-client x11vnc",
                     onLog
                 ) != 0) throw IllegalStateException("Essentials installation failed")
 
