@@ -25,6 +25,11 @@ class X11InputController(private val lorieView: LorieView) {
         }
         lorieView.setOnTouchListener(::handleMotionEvent)
         lorieView.setOnGenericMotionListener(::handleMotionEvent)
+        
+        // ADD THIS FOR RAW MOUSE SUPPORT:
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            lorieView.setOnCapturedPointerListener(::handleMotionEvent)
+        }
     }
 
     fun nextMode(): Int {
