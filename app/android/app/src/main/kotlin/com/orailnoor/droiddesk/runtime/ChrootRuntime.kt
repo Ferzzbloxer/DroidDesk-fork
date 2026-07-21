@@ -70,7 +70,7 @@ class ChrootRuntime(private val context: Context) {
         Log.i(TAG, "Applying chroot-specific rootfs configuration")
         val path = rootfsDir.absolutePath
 
-        rootShell.exec("mkdir -p \"$path/etc/profile.d\" \"$path/etc/apt/apt.conf.d\" \"$path/usr/local/bin\"")
+        rootShell.exec("mkdir -p \"$path/etc/profile.d\" \"$path/etc/apt/apt.conf.d\"")
 
         val haScript = """
             export DISPLAY=:0
@@ -90,34 +90,6 @@ class ChrootRuntime(private val context: Context) {
         """.trimIndent()
         writeRootFile(File(rootfsDir, "etc/profile.d/droiddesk-ha.sh"), haScript)
 
-        // --- NEW GLOBAL AUTO-PATCHER SCRIPT ---
-        val autoPatcherScript = """
-            #!/bin/bash
-            APPS=("code" "code-oss" "google-chrome" "google-chrome-stable" "chromium" "chromium-browser" "discord" "brave-browser" "microsoft-edge" "microsoft-edge-stable" "obsidian" "cursor" "github-desktop" "postman" "slack" "teams")
-            for app in "${'$'}{APPS[@]}"; do
-                BIN_PATH=${'$'}(which "${'$'}app" 2>/dev/null)
-                if [ -n "${'$'}BIN_PATH" ] && [ ! -f "${'$'}BIN_PATH.real" ]; then
-                    mv "${'$'}BIN_PATH" "${'$'}BIN_PATH.real"
-                    if [[ "${'$'}app" == *"code"* || "${'$'}app" == *"cursor"* ]]; then
-                        echo -e '#!/bin/bash\nexec "'"${'$'}BIN_PATH"'.real" --no-sandbox --user-data-dir=/root/.config/app-data "${'$'}@"' > "${'$'}BIN_PATH"
-                    else
-                        echo -e '#!/bin/bash\nexec "'"${'$'}BIN_PATH"'.real" --no-sandbox "${'$'}@"' > "${'$'}BIN_PATH"
-                    fi
-                    chmod +x "${'$'}BIN_PATH"
-                fi
-            done
-            VLC_PATH=${'$'}(which vlc 2>/dev/null)
-            if [ -n "${'$'}VLC_PATH" ] && grep -q "geteuid" "${'$'}VLC_PATH"; then
-                sed -i 's/geteuid/getppid/g' "${'$'}VLC_PATH"
-            fi
-        """.trimIndent()
-        writeRootFile(File(rootfsDir, "usr/local/bin/patch-root-binaries.sh"), autoPatcherScript)
-        rootShell.exec("chmod +x \"$path/usr/local/bin/patch-root-binaries.sh\"")
-
-        // Hook it into APT
-        writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-autopatch"), "DPkg::Post-Invoke { \"/usr/local/bin/patch-root-binaries.sh\"; };\n")
-        // --------------------------------------
-
         val sources = """
             deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
             deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
@@ -132,6 +104,31 @@ class ChrootRuntime(private val context: Context) {
             DPkg::Lock::Timeout "60";
         """.trimIndent()
         writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-droiddesk-reliability"), aptConf)
+
+        // --- NEW: VNC USB Auto-Listener Script ---
+        val vncListenerScript = """
+            #!/bin/bash
+            USB_STATE_FILE="/sys/class/android_usb/android0/state"
+            VNC_RUNNING=0
+            
+            while true; do
+                if grep -q "CONFIGURED" "${'$'}USB_STATE_FILE" 2>/dev/null; then
+                    if [ ${'$'}VNC_RUNNING -eq 0 ] && command -v x11vnc >/dev/null 2>&1; then
+                        x11vnc -display :0 -rfbport 5901 -nopw -noshm -forever -bg >/dev/null 2>&1
+                        VNC_RUNNING=1
+                    fi
+                else
+                    if [ ${'$'}VNC_RUNNING -eq 1 ]; then
+                        killall -9 x11vnc 2>/dev/null
+                        VNC_RUNNING=0
+                    fi
+                fi
+                sleep 3
+            done
+        """.trimIndent()
+        writeRootFile(File(rootfsDir, "usr/local/bin/usb-vnc-listener.sh"), vncListenerScript)
+        rootShell.exec("chmod +x \"$path/usr/local/bin/usb-vnc-listener.sh\"")
+        // ------------------------------------------
 
         Log.i(TAG, "Chroot rootfs configuration complete")
     }
@@ -174,7 +171,7 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.4, "Installing Mesa GPU drivers...")
                 execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
-                            "mesa-vulkan-drivers mesa-opencl-icd libgl1 libgl1-mesa-dri libglx-mesa0 vulkan-tools",
+                            "mesa-vulkan-drivers mesa-opencl-icd libgl1-mesa-dri libglx-mesa0 vulkan-tools",
                     onLog
                 )
 
@@ -191,9 +188,10 @@ class ChrootRuntime(private val context: Context) {
                 ) != 0) throw IllegalStateException("Desktop package installation failed")
 
                 onProgress(0.8, "Installing Essentials...")
+                // We added x11vnc to the end of this list!
                 if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
-                            "git nano htop wget curl python3 python3-pip openssh-client",
+                            "git nano htop wget curl python3 python3-pip openssh-client x11vnc",
                     onLog
                 ) != 0) throw IllegalStateException("Essentials installation failed")
 
@@ -258,14 +256,14 @@ class ChrootRuntime(private val context: Context) {
         val appUid = context.applicationInfo.uid
         val rootStr = "${rootfsDir.absolutePath}/root"
 
-        // 1. Wipe stale locks from previous crashes that freeze the desktop
+        // 1. Wipe stale locks
         rootShell.exec("rm -rf \"$rootStr/.cache/sessions\" /tmp/.X11-unix/X0 /tmp/.X0-lock /tmp/dbus-* 2>/dev/null")
         
-        // THE NETWORK FIX: Destroy any broken symlinks created by Ubuntu updates and force static DNS
+        // 2. Network DNS fix
         rootShell.exec("rm -f \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
         rootShell.exec("echo 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
-
-        // 2. Give Kotlin App User permission to write the Xfce Profile files
+        
+        // 3. Temporarily give app write permissions for config creation
         rootShell.exec("mkdir -p \"$rootStr\" && chown -R $appUid:$appUid \"$rootStr\"")
 
         if (desktopEnv == "xfce4") {
@@ -277,9 +275,8 @@ class ChrootRuntime(private val context: Context) {
             )
         }
 
-        // 3. THE MAGIC FIX: Give everything back to Linux Root!
-        // XFCE Window Manager & DBus will crash if files are owned by the Android App.
-        rootShell.exec("chown -R 0:0 \"$rootStr\" && chmod -R 755 \"$rootStr\"")
+        // 4. Give ownership back to root so the Window Manager works securely
+        rootShell.exec("chown -R 0:0 \"$rootStr\" && chmod -R 750 \"$rootStr\"")
 
         ensureMounts()
         bindX11Socket()
@@ -292,7 +289,6 @@ class ChrootRuntime(private val context: Context) {
             else -> desktopEnv
         }
 
-        // Cleaned up DBus launch sequence to prevent conflicting processes
         val runScript = """
             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             export TMPDIR=/tmp
@@ -303,9 +299,14 @@ class ChrootRuntime(private val context: Context) {
             export LOGNAME=root
             export LD_PRELOAD=/usr/local/lib/libclose_range_hack.so
             . /etc/profile.d/droiddesk-ha.sh 2>/dev/null || true
+            export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session
+            rm -f /tmp/dbus-session
+            dbus-daemon --session --address="${'$'}DBUS_SESSION_BUS_ADDRESS" --fork --nopidfile
             mkdir -p /tmp/.X11-unix
             
-            # Start desktop with its own dedicated DBus session
+            # Start USB VNC Listener
+            /usr/local/bin/usb-vnc-listener.sh &
+            
             exec dbus-run-session -- $deBin
         """.trimIndent()
 
@@ -330,8 +331,8 @@ class ChrootRuntime(private val context: Context) {
         sessionProcess?.destroyForcibly()
         sessionProcess = null
         
-        // Force-kill all ghost UI processes to ensure a clean launch next time
-        rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c 'killall -9 xfce4-session xfwm4 xfdesktop xfce4-panel dbus-daemon lxqt-session startplasma-x11 kwin_x11 2>/dev/null'")
+        // Force-kill all ghosts including our VNC script and x11vnc
+        rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c 'killall -9 xfce4-session xfwm4 xfdesktop xfce4-panel dbus-daemon lxqt-session startplasma-x11 kwin_x11 usb-vnc-listener.sh x11vnc 2>/dev/null'")
         
         unmountAll()
     }
