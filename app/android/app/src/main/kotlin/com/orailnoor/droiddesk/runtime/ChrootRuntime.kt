@@ -105,7 +105,6 @@ class ChrootRuntime(private val context: Context) {
         """.trimIndent()
         writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-droiddesk-reliability"), aptConf)
 
-        // --- VNC USB Auto-Listener Script ---
         val vncListenerScript = """
             #!/bin/bash
             USB_STATE_FILE="/sys/class/android_usb/android0/state"
@@ -128,9 +127,41 @@ class ChrootRuntime(private val context: Context) {
         """.trimIndent()
         writeRootFile(File(rootfsDir, "usr/local/bin/usb-vnc-listener.sh"), vncListenerScript)
         rootShell.exec("chmod +x \"$path/usr/local/bin/usb-vnc-listener.sh\"")
-        // ------------------------------------------
 
         Log.i(TAG, "Chroot rootfs configuration complete")
+    }
+
+    // NEW: Auto-heals existing installations and hooks the binary patcher
+    private fun ensureAutoPatcher() {
+        val scriptPath = File(rootfsDir, "usr/local/bin/patch-root-binaries.sh")
+        if (!scriptPath.exists()) {
+            val autoPatcherScript = """
+                #!/bin/bash
+                APPS=("code" "code-oss" "google-chrome" "google-chrome-stable" "chromium" "chromium-browser" "discord" "brave-browser" "microsoft-edge" "microsoft-edge-stable" "obsidian" "cursor" "github-desktop" "postman" "slack" "teams")
+                for app in "${'$'}{APPS[@]}"; do
+                    for BIN_PATH in "/usr/bin/${'$'}app" "/usr/local/bin/${'$'}app"; do
+                        if [ -L "${'$'}BIN_PATH" ] || [ -f "${'$'}BIN_PATH" ]; then
+                            if [ ! -f "${'$'}BIN_PATH.real" ] && ! grep -q "no-sandbox" "${'$'}BIN_PATH" 2>/dev/null; then
+                                mv "${'$'}BIN_PATH" "${'$'}BIN_PATH.real"
+                                echo '#!/bin/bash' > "${'$'}BIN_PATH"
+                                if [[ "${'$'}app" == *"code"* || "${'$'}app" == *"cursor"* ]]; then
+                                    echo 'exec "'"${'$'}BIN_PATH"'.real" --no-sandbox --user-data-dir=/root/.config/app-data "${'$'}@"' >> "${'$'}BIN_PATH"
+                                else
+                                    echo 'exec "'"${'$'}BIN_PATH"'.real" --no-sandbox "${'$'}@"' >> "${'$'}BIN_PATH"
+                                fi
+                                chmod +x "${'$'}BIN_PATH"
+                            fi
+                        fi
+                    done
+                done
+                if [ -f "/usr/bin/vlc" ] && grep -q "geteuid" "/usr/bin/vlc"; then
+                    sed -i 's/geteuid/getppid/g' "/usr/bin/vlc"
+                fi
+            """.trimIndent()
+            writeRootFile(scriptPath, autoPatcherScript)
+            rootShell.exec("chmod +x \"${scriptPath.absolutePath}\"")
+            writeRootFile(File(rootfsDir, "etc/apt/apt.conf.d/99-autopatch"), "DPkg::Post-Invoke { \"/usr/local/bin/patch-root-binaries.sh\"; };\n")
+        }
     }
 
     fun installDesktopEnvironment(
@@ -147,6 +178,7 @@ class ChrootRuntime(private val context: Context) {
             try {
                 onProgress(0.0, "Configuring Ubuntu for Android...")
                 configureChrootRootfs()
+                ensureAutoPatcher()
 
                 onProgress(0.05, "Mounting virtual filesystems...")
                 ensureMounts()
@@ -164,7 +196,7 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.2, "Installing core tools...")
                 if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
-                            "locales ca-certificates wget curl dbus-x11",
+                            "locales ca-certificates wget curl dbus-x11 libgl1 x11-xserver-utils",
                     onLog
                 ) != 0) throw IllegalStateException("Core package installation failed")
 
@@ -190,7 +222,7 @@ class ChrootRuntime(private val context: Context) {
                 onProgress(0.8, "Installing Essentials...")
                 if (execChroot(
                     "DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -o APT::Sandbox::User=root install -y --no-install-recommends " +
-                            "libgl1 git nano htop wget curl python3 python3-pip openssh-client x11vnc",
+                            "git nano htop wget curl python3 python3-pip openssh-client x11vnc",
                     onLog
                 ) != 0) throw IllegalStateException("Essentials installation failed")
 
@@ -214,6 +246,7 @@ class ChrootRuntime(private val context: Context) {
         return try {
             ensureMounts()
             execChroot("dpkg --configure -a", onLog)
+            ensureAutoPatcher()
             
             val command = when (appId) {
                 "firefox" -> """
@@ -255,15 +288,14 @@ class ChrootRuntime(private val context: Context) {
         val appUid = context.applicationInfo.uid
         val rootStr = "${rootfsDir.absolutePath}/root"
 
-        // Wipe stale locks
         rootShell.exec("rm -rf \"$rootStr/.cache/sessions\" /tmp/.X11-unix/X0 /tmp/.X0-lock /tmp/dbus-* 2>/dev/null")
-        
-        // Network DNS fix
         rootShell.exec("rm -f \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
         rootShell.exec("echo 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > \"${rootfsDir.absolutePath}/etc/resolv.conf\"")
         
-        // Temporarily give app write permissions for config creation
         rootShell.exec("mkdir -p \"$rootStr\" && chown -R $appUid:$appUid \"$rootStr\"")
+
+        // Ensure auto patcher exists for existing setups
+        ensureAutoPatcher()
 
         if (desktopEnv == "xfce4") {
             XfceMobileProfile.install(
@@ -274,7 +306,6 @@ class ChrootRuntime(private val context: Context) {
             )
         }
 
-        // Give ownership back to root so the Window Manager works securely
         rootShell.exec("chown -R 0:0 \"$rootStr\" && chmod -R 750 \"$rootStr\"")
 
         ensureMounts()
@@ -305,6 +336,9 @@ class ChrootRuntime(private val context: Context) {
             # Start USB VNC Listener
             /usr/local/bin/usb-vnc-listener.sh &
             
+            # Sweep manually installed apps to apply the patch instantly
+            /usr/local/bin/patch-root-binaries.sh &
+            
             exec dbus-run-session -- $deBin
         """.trimIndent()
 
@@ -329,7 +363,6 @@ class ChrootRuntime(private val context: Context) {
         sessionProcess?.destroyForcibly()
         sessionProcess = null
         
-        // Force-kill all ghosts including our VNC script and x11vnc
         rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c 'killall -9 xfce4-session xfwm4 xfdesktop xfce4-panel dbus-daemon lxqt-session startplasma-x11 kwin_x11 usb-vnc-listener.sh x11vnc 2>/dev/null'")
         
         unmountAll()
