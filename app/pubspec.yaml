@@ -1,7 +1,7 @@
 name: droiddesk
 description: "DroidDesk - Full Linux Desktop on Android"
 publish_to: 'none'
-version: 0.1.0
+version: 0.1.61+61
 
 environment:
   sdk: ^3.10.3
